@@ -70,12 +70,18 @@ def main() -> int:
 
         print("3. grows only from the inside, every action on record")
         guard.record_action("tool", "send_email", {"to": "legal@acme.test"}, {"sent": True}, summary="sent draft")
+        intent = guard.begin_action("memory", {"add": "cap"})          # a signed intent is on disk before the tool runs
         (home / "memories" / "MEMORY.md").write_text("- client: Acme\n- Acme wants a 2x liability cap\n")
-        sealed = guard.reseal("memory write")
-        scenario("agent's own memory write is re-sealed on the ledger", bool(sealed["memory"]) and sealed["core"] is None)
+        guard.end_action(intent, "memory", {"ok": True})                # the change is sealed, tied to that record
+        scenario("agent's own memory write is sealed to the action that made it", ledger.get_bank(ada.bank_id)["seal"]["seq"] == 1)
+        (home / "memories" / "MEMORY.md").write_text("- client: Acme\n- PLANTED WHILE IT WAS RUNNING\n")
+        scenario("a write from outside WHILE it runs stops the agent before its next action",
+                 *refused(SealError, lambda: guard.begin_action("send_email", {"to": "anyone"})))
         guard.stop()
+        ada.restore("memory", ledger.get_bank(ada.bank_id)["seal"]["root"])
         record = ledger.get_agent(ada.agent_id)
-        scenario("action log anchored; lease released", record["actions"]["count"] == 1 and record["lease"] is None)
+        scenario("intents and results anchored; nothing planted was sealed; lease released",
+                 record["actions"]["count"] == 4 and record["lease"] is None and A.verify(ada, ledger)["ok"])
         scenario("the stale copy can never run again", *refused(SealError, SingularGuard(clone, ledger, PASS).start))
 
         print("4. no additions from outside")

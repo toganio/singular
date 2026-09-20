@@ -4,11 +4,11 @@ Singular never patches Hermes. It plugs into the official plugin entry point
 (``hermes_agent.plugins``) and uses only public hooks, so a new Hermes release is adopted by
 merging it and running ``tests/test_hermes_contract.py``:
 
-* ``on_session_start``   - first session in this process: verify seals, take the run lease.
-* ``pre_tool_call``      - the one hook that can veto. No provable lease -> every tool is blocked.
-* ``post_tool_call``     - liability log; re-seal right after memory / skill writes.
-* ``on_skill_lifecycle`` - re-seal when a skill is created, edited or removed.
-* ``on_session_end`` / ``on_session_finalize`` - anchor actions and re-seal.
+* ``on_session_start``   - first session for this agent home: pin-check the ledger, verify seals, take the run lease.
+* ``pre_tool_call``      - the one hook that can veto. Lease provable? Files untouched since the last seal? Signed
+  intent written? Otherwise the tool is blocked.
+* ``post_tool_call``     - signed result record; whatever the tool changed in the agent is sealed, tied to that record.
+* ``on_session_end`` / ``on_session_finalize`` - idle check and anchor.
 * tool ``memory_bank``   - the agent's own read / search / append access to the external banks it was granted.
 * process exit           - final seal, release the lease.
 
@@ -36,12 +36,13 @@ logger = logging.getLogger("singular.hermes")
 # Hooks this plugin relies on. tests/test_hermes_contract.py asserts Hermes still offers them.
 HOOKS_USED = ("on_session_start", "pre_tool_call", "post_tool_call", "on_skill_lifecycle",
               "on_session_end", "on_session_finalize")
-# Tools after which the agent has (probably) written to itself.
-SELF_WRITE_TOOLS = ("memory", "skill_manage", "skill_manager", "skills", "cron")
 
 _lock = threading.RLock()
-_guard: SingularGuard | None = None
-_failure: str | None = None
+# One guard per agent home: a gateway process can serve several Hermes profiles at once.
+_guards: dict[str, SingularGuard] = {}
+_failures: dict[str, str] = {}
+_intents: dict[tuple[str, str], list[int]] = {}
+_exit_hooked = False
 
 
 def _hermes_home() -> Path:
@@ -52,10 +53,18 @@ def _hermes_home() -> Path:
         return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
 
 
+def _key() -> str:
+    return str(_hermes_home().resolve())
+
+
 def _passphrase() -> str:
     value = os.environ.pop("SINGULAR_PASSPHRASE", "")
     if value:
+        _passphrase.cached = value  # type: ignore[attr-defined]  # other profiles in this process may need it
         return value
+    cached = getattr(_passphrase, "cached", "")
+    if cached:
+        return cached
     if sys.stdin is not None and sys.stdin.isatty():
         return getpass.getpass("Singular agent passphrase: ")
     raise SingularError("SINGULAR_PASSPHRASE is not set and there is no terminal to ask on")
@@ -63,21 +72,29 @@ def _passphrase() -> str:
 
 def adopt_guard(guard: SingularGuard) -> None:
     """Used by ``singular run``: the launcher already verified and leased; the plugin takes it from there."""
-    global _guard, _failure
     with _lock:
-        _guard, _failure = guard, None
+        key = str(guard.home.home.resolve())
+        _guards[key] = guard
+        _failures.pop(key, None)
 
 
 def current_guard() -> SingularGuard | None:
-    return _guard
+    return _guards.get(_key())
+
+
+def _reset_for_tests() -> None:
+    with _lock:
+        _guards.clear(), _failures.clear(), _intents.clear()
+        _passphrase.cached = ""  # type: ignore[attr-defined]
 
 
 def _ensure_guard() -> SingularGuard | None:
-    """Start the guard once per process. Returns None for non-Singular homes."""
-    global _guard, _failure
+    """Start the guard once per agent home. Returns None for non-Singular homes and after a refusal."""
+    global _exit_hooked
     with _lock:
-        if _guard is not None or _failure is not None:
-            return _guard
+        key = _key()
+        if key in _guards or key in _failures:
+            return _guards.get(key)
         home = AgentHome(_hermes_home())
         if not home.is_singular:
             return None
@@ -85,18 +102,19 @@ def _ensure_guard() -> SingularGuard | None:
             guard = SingularGuard(home, open_ledger(home.identity["ledger_url"]), _passphrase())
             guard.start()
         except Exception as exc:  # noqa: BLE001 - any failure means "do not act"
-            _failure = str(exc)
+            _failures[key] = str(exc)
             logger.error("Singular refused to start this agent: %s", exc)
             return None
-        _guard = guard
-        atexit.register(_shutdown)
+        _guards[key] = guard
+        if not _exit_hooked:
+            atexit.register(_shutdown)
+            _exit_hooked = True
         logger.info("Singular: %s holds the run lease (lease #%s)", guard.agent_id, guard.lease["no"])
         return guard
 
 
 def _shutdown() -> None:
-    guard = _guard
-    if guard is not None:
+    for guard in list(_guards.values()):
         try:
             guard.stop()
         except Exception as exc:  # noqa: BLE001
@@ -113,58 +131,64 @@ def on_session_start(**_kwargs):
     _ensure_guard()
 
 
-def pre_tool_call(tool_name: str = "", **_kwargs):
-    if _guard is None and _failure is None and not _is_singular_home():
+def pre_tool_call(tool_name: str = "", args=None, tool_call_id: str = "", session_id: str = "", **_kwargs):
+    """The veto point. Before any tool runs: provable lease, untouched files, signed intent on disk."""
+    key = _key()
+    if key not in _guards and key not in _failures and not _is_singular_home():
         return None
     guard = _ensure_guard()
     try:
         if guard is None:
-            raise SingularError(_failure or "guard not running")
-        guard.check()
-    except SingularError as exc:
+            raise SingularError(_failures.get(key) or "guard not running")
+        intent = guard.begin_action(tool_name, args or {}, session=str(session_id or ""))
+        with _lock:
+            _intents.setdefault((key, str(tool_call_id or tool_name)), []).append(intent)
+    except (SingularError, OSError) as exc:
         return {"action": "block",
-                "message": f"BLOCKED by Singular: this agent cannot prove it is the one running instance ({exc}). "
+                "message": f"BLOCKED by Singular: this agent cannot prove it is the one running, untouched instance ({exc}). "
                            f"Tool '{tool_name}' was not executed."}
     return None
 
 
 def post_tool_call(tool_name: str = "", args=None, result=None, status=None, session_id: str = "",
-                   error_message=None, **_kwargs):
-    guard = _guard
+                   tool_call_id: str = "", error_message=None, **_kwargs):
+    key = _key()
+    guard = _guards.get(key)
     if guard is None:
         return None
+    with _lock:
+        queue = _intents.get((key, str(tool_call_id or tool_name))) or []
+        intent = queue.pop(0) if queue else None
     try:
-        guard.record_action("tool", tool_name, args or {}, result, status=str(status or "ok"),
-                            summary=str(error_message or "")[:200], session=str(session_id or ""))
-        if any(tool_name == name or tool_name.startswith(name + "_") for name in SELF_WRITE_TOOLS):
-            guard.reseal(f"after {tool_name}")
-    except SingularError as exc:
-        logger.error("Singular could not record '%s': %s", tool_name, exc)
+        guard.end_action(intent, tool_name, result, status=str(status or "ok"),
+                         summary=str(error_message or "")[:200], session=str(session_id or ""))
+    except (SingularError, OSError) as exc:
+        logger.error("Singular could not record the result of '%s': %s", tool_name, exc)
     return None
 
 
 def on_skill_lifecycle(**_kwargs):
-    _reseal("skill lifecycle")
+    return None  # skill changes happen inside tool calls and are sealed with them; kept for the contract test
 
 
 def on_session_end(**_kwargs):
-    _reseal("session end", anchor=True)
+    _idle_check(anchor=True)
 
 
 def on_session_finalize(**_kwargs):
-    _reseal("session finalize", anchor=True)
+    _idle_check(anchor=True)
 
 
-def _reseal(reason: str, anchor: bool = False) -> None:
-    guard = _guard
+def _idle_check(anchor: bool = False) -> None:
+    guard = _guards.get(_key())
     if guard is None:
         return
     try:
+        guard.check_idle()
         if anchor:
             guard.anchor_actions()
-        guard.reseal(reason)
     except SingularError as exc:
-        logger.error("Singular reseal (%s) failed: %s", reason, exc)
+        logger.error("Singular: %s", exc)
 
 
 # -- the agent's own access to external memory banks --------------------------------------------
@@ -202,7 +226,7 @@ def memory_bank_tool(args: dict, **_kwargs) -> str:
     guard = _ensure_guard()
     try:
         if guard is None:
-            raise SingularError(_failure or "this is not a running Singular agent")
+            raise SingularError(_failures.get(_key()) or "this is not a running Singular agent")
         guard.check()
         action = str(args.get("action") or "")
         banks = attached_banks(guard.home)

@@ -54,3 +54,10 @@ def agent(tmp_path, ledger, owner):
     home = make_home(tmp_path / "home")
     return init_agent(home, ledger, "local", owner, PASS, name="Ada", function="contracts assistant",
                       lease_ttl_ms=60_000)
+
+
+def agent_writes(guard, relpath: str, text: str, tool: str = "memory") -> None:
+    """What a real tool call does: intent -> the agent changes itself -> result (which seals the change)."""
+    intent = guard.begin_action(tool, {"path": relpath})
+    (guard.home.home / relpath).write_text(text)
+    guard.end_action(intent, tool, {"ok": True})

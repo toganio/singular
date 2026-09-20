@@ -28,6 +28,7 @@ class Ledger(Protocol):
     def get_bank(self, bank_id: str) -> dict | None: ...
     def history(self, subject: str) -> list[dict]: ...
     def submit(self, tx: dict) -> dict: ...
+    def block_hash_at(self, height: int) -> str | None: ...
 
 
 class LocalLedger:
@@ -48,6 +49,10 @@ class LocalLedger:
 
     def submit(self, tx: dict) -> dict:
         return self.chain.submit(tx)
+
+    def block_hash_at(self, height: int) -> str | None:
+        blocks = self.chain.blocks(height, 1)
+        return block_hash(blocks[0]["header"]) if blocks and blocks[0]["header"]["height"] == height else None
 
 
 class HttpLedger:
@@ -109,6 +114,10 @@ class HttpLedger:
         if "error" in body:
             raise LedgerRejected(str(body["error"]), str(body.get("message", "")))
         raise LedgerUnavailable(f"ledger answered {status}")
+
+    def block_hash_at(self, height: int) -> str | None:
+        blocks = self._call(f"/blocks?from={int(height)}&limit=1")[1].get("blocks", [])
+        return block_hash(blocks[0]["header"]) if blocks and blocks[0]["header"]["height"] == height else None
 
     def fetch_blocks(self, start: int = 0):
         while True:

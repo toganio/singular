@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import __version__, agent as A
+from . import __version__, agent as A, tree
 from .bank import BankOwner, DirStore, attach_bank, attached_banks, bank_transfer_request, detach_bank
 from .errors import SingularError
 from .keys import SigningKey, load_keystore, save_keystore, unwrap_key, wrap_key
@@ -68,7 +68,8 @@ def cmd_init(args) -> int:
     home = A.init_agent(args.home, ledger, args.ledger, _owner_key(args),
                         _secret("SINGULAR_PASSPHRASE", "New agent passphrase", confirm=True),
                         name=args.name, function=args.function, lease_ttl_ms=args.lease_ttl * 1000,
-                        allow_owner_attest=args.allow_owner_edits)
+                        allow_owner_attest=args.allow_owner_edits,
+                        baselines=[] if args.seal_shipped_skills else [dict(tree.HERMES_SKILLS_BASELINE)])
     _enable_hermes_plugin(home.home)
     _print({"agent_id": home.agent_id, "memory_bank": home.bank_id, "home": str(home.home), "chain_id": home.identity["chain_id"]})
     return 0
@@ -177,6 +178,8 @@ def cmd_owner_action(args) -> int:
     ledger, key, chain_id = _ledger_for(home, args), _owner_key(args), home.identity["chain_id"]
     if args.action == "revoke-lease":
         _print(A.revoke_lease(home, ledger, chain_id, key))
+    elif args.action == "rotate-key":
+        _print(A.rotate_agent_key(home, ledger, key, _secret("SINGULAR_NEW_PASSPHRASE", "New agent passphrase", confirm=True)))
     elif args.action == "retire":
         _print(A.retire(home.agent_id, ledger, chain_id, key))
     elif args.action == "rollback":
@@ -283,6 +286,8 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p.add_argument("--name", required=True)
     p.add_argument("--function", required=True, help="what this agent is for (public, permanent)")
     p.add_argument("--lease-ttl", type=int, default=600, help="seconds a run lease lives without a heartbeat")
+    p.add_argument("--seal-shipped-skills", action="store_true",
+                   help="also seal the skills Hermes ships (then every Hermes update needs an owner-attested re-seal)")
     p.add_argument("--allow-owner-edits", action="store_true", help="permit owner-attested manual edits (recorded on the ledger)")
     add("status", cmd_status, "verify files against the ledger", home=True)
     add("verify", cmd_status, "alias of status", home=True)
@@ -299,7 +304,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p.add_argument("step", choices=["request", "approve", "finalize"])
     p.add_argument("--file", default="transfer-request.json")
     p = add("owner", cmd_owner_action, "owner-only actions", home=True, owner=True)
-    p.add_argument("action", choices=["revoke-lease", "retire", "rollback", "attest"])
+    p.add_argument("action", choices=["revoke-lease", "rotate-key", "retire", "rollback", "attest"])
     p.add_argument("--root")
     p.add_argument("--reason", default="owner edit")
     p = add("prove", cmd_prove, "prove to a service that you own an agent (signs a one-time challenge locally)", owner=True)

@@ -103,7 +103,7 @@ class AgentHome:
 
     def scan_core(self, use_cache: bool = False) -> list[dict]:
         ident = self.identity
-        return tree.scan(self.home, ident["core"], ident.get("exclude"), self._cache(use_cache))
+        return tree.scan(self.home, ident["core"], ident.get("exclude"), self._cache(use_cache), ident.get("baselines"))
 
     def scan_memory(self, use_cache: bool = False) -> list[dict]:
         ident = self.identity
@@ -203,7 +203,7 @@ def init_agent(home: str | Path, ledger: Ledger, ledger_url: str, owner_key: Sig
                name: str, function: str, details: dict | None = None,
                lease_ttl_ms: int = DEFAULT_LEASE_TTL_MS, allow_owner_attest: bool = False,
                core: list[str] | None = None, memory: list[str] | None = None,
-               exclude: list[str] | None = None) -> AgentHome:
+               exclude: list[str] | None = None, baselines: list[dict] | None = None) -> AgentHome:
     """Turn an existing agent folder into a Singular agent and register it on the ledger."""
     agent_home = AgentHome(home)
     if agent_home.is_singular:
@@ -217,7 +217,7 @@ def init_agent(home: str | Path, ledger: Ledger, ledger_url: str, owner_key: Sig
     policy = {"lease_ttl_ms": lease_ttl_ms, "allow_owner_attest": allow_owner_attest}
     identity = {"v": 1, "agent_id": agent_id, "chain_id": chain_id, "ledger_url": ledger_url,
                 "descriptor": descriptor, "policy": policy, "core": core or list(tree.DEFAULT_CORE),
-                "memory": memory or list(tree.DEFAULT_MEMORY), "exclude": exclude or [],
+                "memory": memory or list(tree.DEFAULT_MEMORY), "exclude": exclude or [], "baselines": baselines or [],
                 "genesis": {"agent_pub": agent_key.public_hex, "owner_pub": owner_key.public_hex, "salt": salt}}
     for rel in identity["memory"]:
         (agent_home.home / rel).mkdir(parents=True, exist_ok=True)
@@ -270,6 +270,17 @@ def revoke_lease(agent_home_or_id, ledger: Ledger, chain_id: str, owner_key: Sig
 def retire(agent_id: str, ledger: Ledger, chain_id: str, owner_key: SigningKey) -> dict:
     record = require_agent(ledger, agent_id)
     return submit(ledger, chain_id, T.RETIRE, agent_id, record["nonce"] + 1, {}, {"owner": owner_key})
+
+
+def rotate_agent_key(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, new_passphrase: str) -> dict:
+    """Replace a leaked agent key in place. The new key is written only after the ledger accepted it."""
+    record = require_agent(ledger, agent_home.agent_id)
+    new_key = SigningKey.generate()
+    receipt = submit(ledger, agent_home.identity["chain_id"], T.ROTATE_KEY, record["id"], record["nonce"] + 1,
+                     {"new_agent_pub": new_key.public_hex, "new_enc_pub": new_key.enc_public_hex},
+                     {"owner": owner_key, "new_agent": new_key})
+    save_keystore(agent_home.keystore_path, wrap_key(new_key, new_passphrase, label="agent"))
+    return receipt
 
 
 def rollback(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, root: str) -> dict:

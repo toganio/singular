@@ -27,13 +27,18 @@ from .errors import SealError
 
 SINGULAR_DIR = ".singular"
 
-DEFAULT_CORE = ["SOUL.md", "profile.yaml", "skills", "cron/jobs.json"]
+# (cron/jobs.json is not here: the scheduler rewrites it on every tick, outside any agent action.)
+DEFAULT_CORE = ["SOUL.md", "profile.yaml", "skills"]
 DEFAULT_MEMORY = ["memories"]
 
 # Never sealed, never exported, whatever the include lists say.
 # (Hermes also counts its session database as secret material; tests/test_hermes_contract.py keeps this list honest.)
 SECRET_NAMES = frozenset({".env", ".env.local", "auth.json", "auth.lock", "vault.key", "vault.json.enc", "state.db"})
-DEFAULT_EXCLUDE = ["__pycache__", "*.pyc", ".DS_Store", "*.tmp", "*.lock", "*.db", "*.db-wal", "*.db-shm", "*-journal",
+# Files that the *installed agent software* ships and copies into the home are product content, not identity.
+# A baseline maps a sealed prefix to the directory the software ships; see ``scan``.
+HERMES_SKILLS_BASELINE = {"prefix": "skills", "source": "hermes:bundled_skills"}
+
+DEFAULT_EXCLUDE = [".bundled_manifest", ".bundled_manifest_*", "__pycache__", "*.pyc", ".DS_Store", "*.tmp", "*.lock", "*.db", "*.db-wal", "*.db-shm", "*-journal",
                    ".usage.json", ".usage_*", ".hub", ".git"]
 
 
@@ -70,8 +75,9 @@ def file_sha256(path: Path) -> tuple[str, int]:
 class HashCache:
     """Skips re-reading unchanged files during *runtime* reseals of a large memory.
 
-    Keyed on (size, mtime_ns, inode). A cache is a performance hint an attacker with disk access
-    could lie to, so every trust decision (startup verification, import, transfer) hashes in full.
+    Keyed on (size, mtime_ns, ctime_ns, inode). ``ctime`` is the part that matters: ``utime()`` can forge
+    mtime after an in-place edit, but nothing short of changing the system clock can set ctime back. It is
+    still only a performance hint, so every trust decision (startup, import, transfer) hashes in full.
     """
 
     def __init__(self, path: Path | None):
@@ -86,10 +92,10 @@ class HashCache:
 
     def lookup(self, key: str, st: os.stat_result) -> str | None:
         hit = self._data.get(key)
-        return hit[3] if hit and hit[:3] == [st.st_size, st.st_mtime_ns, st.st_ino] else None
+        return hit[4] if hit and hit[:4] == [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino] else None
 
     def store(self, key: str, st: os.stat_result, digest: str) -> None:
-        self._data[key] = [st.st_size, st.st_mtime_ns, st.st_ino, digest]
+        self._data[key] = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, digest]
         self._dirty = True
 
     def save(self) -> None:
@@ -101,16 +107,66 @@ class HashCache:
             self._dirty = False
 
 
+def resolve_baseline(source: str) -> Path | None:
+    """Where the installed software keeps the pristine copy. Unknown or unavailable -> no baseline, which is the
+    safe direction: everything is sealed."""
+    if source == "hermes:bundled_skills":
+        override = os.environ.get("HERMES_BUNDLED_SKILLS")
+        if override:
+            return Path(override) if Path(override).is_dir() else None
+        try:
+            from tools.skills_sync import _get_bundled_dir  # type: ignore  # pinned by tests/test_hermes_contract.py
+            found = Path(_get_bundled_dir())
+            return found if found.is_dir() else None
+        except Exception:  # noqa: BLE001 - Hermes not importable here
+            return None
+    return None
+
+
 def scan(home: Path, include: list[str], exclude: list[str] | None = None,
-         cache: HashCache | None = None) -> list[dict]:
+         cache: HashCache | None = None, baselines: list[dict] | None = None) -> list[dict]:
     """List every sealed entry under ``home`` for the given include paths, sorted by path.
 
     A regular file becomes ``{"p", "h", "s"}``; a symlink becomes ``{"p", "l"}`` and is *never
     followed*, so a link cannot smuggle outside content under the seal.
+
+    ``baselines``: a file under a baseline prefix that is byte-identical to the file the installed software
+    ships at the same relative path is skipped. So the seal covers exactly what is the agent's own: every
+    skill it wrote, and every shipped skill that differs by even one byte from what the software ships. A
+    software update can refresh shipped files without breaking the seal; nobody can alter one unnoticed,
+    because the altered file stops matching the baseline and lands under the seal, where it changes the root.
     """
     home = Path(home)
     patterns = DEFAULT_EXCLUDE + list(exclude or [])
     entries: dict[str, dict] = {}
+    shipped: list[tuple[PurePosixPath, Path]] = []
+    for baseline in baselines or []:
+        source = resolve_baseline(str(baseline.get("source", "")))
+        if source is not None:
+            shipped.append((PurePosixPath(str(baseline.get("prefix", ""))), source))
+
+    def is_shipped(rel: PurePosixPath, digest: str) -> bool:
+        for prefix, source in shipped:
+            try:
+                inside = rel.relative_to(prefix)
+            except ValueError:
+                continue
+            twin = source.joinpath(*inside.parts)
+            try:
+                st = os.lstat(twin)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            key = f"baseline:{twin}"
+            twin_digest = cache.lookup(key, st) if cache else None
+            if twin_digest is None:
+                twin_digest, _ = file_sha256(twin)
+                if cache:
+                    cache.store(key, st, twin_digest)
+            if twin_digest == digest:
+                return True
+        return False
 
     def add(path: Path) -> None:
         rel = PurePosixPath(path.relative_to(home).as_posix())
@@ -130,7 +186,8 @@ def scan(home: Path, include: list[str], exclude: list[str] | None = None,
                 digest, _ = file_sha256(path)
                 if cache:
                     cache.store(str(rel), st, digest)
-            entries[str(rel)] = {"p": str(rel), "h": digest, "s": st.st_size}
+            if not is_shipped(rel, digest):
+                entries[str(rel)] = {"p": str(rel), "h": digest, "s": st.st_size}
         # sockets, devices, fifos: not agent state
 
     for item in include:
