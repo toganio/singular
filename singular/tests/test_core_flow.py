@@ -216,3 +216,20 @@ def test_moving_your_own_agent_keeps_key_and_history(agent, ledger, tmp_path):
     guard = SingularGuard(moved, ledger, PASS, heartbeat=False)
     guard.start()
     guard.stop()
+
+
+def test_prove_ownership_signs_a_site_bound_challenge(agent, ledger, owner):
+    from singular.canonical import canonical
+    from singular.errors import SingularError
+    from singular.keys import verify_signature
+    challenge = "ab" * 32
+    proof = A.prove_ownership(owner, agent.agent_id, challenge, "cloud.example.com")
+    message = b"singular-link:v1:" + canonical({"agent": agent.agent_id, "challenge": challenge, "site": "cloud.example.com"})
+    assert message == f'singular-link:v1:{{"agent":"{agent.agent_id}","challenge":"{challenge}","site":"cloud.example.com"}}'.encode()
+    on_ledger = ledger.get_agent(agent.agent_id)["owner_pub"]
+    assert proof["owner_pub"] == on_ledger and verify_signature(on_ledger, message, proof["sig"])
+    other_site = b"singular-link:v1:" + canonical({"agent": agent.agent_id, "challenge": challenge, "site": "evil.example.com"})
+    assert not verify_signature(on_ledger, other_site, proof["sig"])          # cannot be replayed at another service
+    for bad in (("sng1short", challenge, "a.com"), (agent.agent_id, "zz", "a.com"), (agent.agent_id, challenge, 'a.com"}')):
+        with pytest.raises(SingularError):
+            A.prove_ownership(owner, *bad)
