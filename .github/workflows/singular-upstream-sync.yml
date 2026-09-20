@@ -1,0 +1,112 @@
+name: singular-upstream-sync
+
+# Follows Hermes Agent releases. Daily: is there a release tag newer than singular/HERMES_BASE?
+# If so: merge it on a branch, bump HERMES_BASE, open a PR. singular-ci then proves (or disproves) that
+# Singular still works on the new Hermes. Green -> merges itself (merge commit, never squash: squashing
+# would cut the ancestry and make the *next* sync conflict). Red -> the PR stays open and an issue says so.
+#
+# Needs a repo secret SYNC_TOKEN (classic PAT with `repo` + `workflow`, or a fine-grained token with
+# contents/pull-requests/workflows write): the default GITHUB_TOKEN may not push commits that touch
+# .github/workflows, and PRs it opens do not trigger other workflows.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Hermes tag to sync to (default: latest release)"
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: singular-upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: NousResearch/hermes-agent
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Require SYNC_TOKEN
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then echo "::error::secret SYNC_TOKEN is not set (see the comment at the top of this workflow)"; exit 1; fi
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+      - name: Find the target release
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          WANTED: ${{ inputs.tag }}
+        run: |
+          tag="${WANTED:-$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)}"
+          case "$tag" in v[0-9]*) ;; *) echo "::error::unexpected tag '$tag'"; exit 1;; esac
+          base="$(cat singular/HERMES_BASE)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          if [ "$tag" = "$base" ]; then echo "needed=false" >> "$GITHUB_OUTPUT"; echo "already on $tag";
+          elif gh pr list --head "upstream-sync/$tag" --state open --json number -q '.[0].number' | grep -q .; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"; echo "sync PR for $tag is already open";
+          else echo "needed=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Merge the release on a branch
+        if: steps.target.outputs.needed == 'true'
+        id: merge
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          git config user.name "singular-sync"
+          git config user.email "singular-sync@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream "refs/tags/$TAG:refs/tags/$TAG"
+          git checkout -b "upstream-sync/$TAG"
+          if git merge --no-ff --no-edit "$TAG" -m "sync: Hermes Agent $TAG"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            # Singular owns no shared files, so this should not happen. If it does, say exactly where.
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            git merge --abort
+            exit 0
+          fi
+          echo "$TAG" > singular/HERMES_BASE
+          git commit -am "sync: HERMES_BASE -> $TAG"
+          git push --force-with-lease origin "upstream-sync/$TAG"
+      - name: Open the PR and arm auto-merge
+        if: steps.target.outputs.needed == 'true' && steps.merge.outputs.conflict == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+          BASE: ${{ steps.target.outputs.base }}
+        run: |
+          url=$(gh pr create --base main --head "upstream-sync/$TAG" --title "sync: Hermes Agent $TAG" \
+            --body "Automated sync from \`$BASE\` to \`$TAG\` (https://github.com/$UPSTREAM/releases/tag/$TAG).
+
+          \`singular-ci\` runs the Hermes contract test, the integration tests and the end-to-end demo on this Hermes.
+          Green merges itself. If it is red, \`singular/tests/test_hermes_contract.py\` names what Hermes changed;
+          adapt \`singular/src/singular/hermes_plugin.py\` on this branch.
+
+          **Merge with a merge commit, never squash.**")
+          gh pr merge "$url" --auto --merge
+      - name: Report a merge conflict
+        if: steps.target.outputs.needed == 'true' && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          gh issue create --title "Hermes $TAG does not merge cleanly" \
+            --body "Conflicting files:
+          \`\`\`
+          $(cat /tmp/conflicts.txt)
+          \`\`\`
+          Singular is supposed to own no shared files; one of these was edited on our side."
+          exit 1
