@@ -227,6 +227,47 @@ def bank_transfer_request(ledger: Ledger, bank_id: str, new_owner_key: SigningKe
             "enc_pub": new_owner_key.enc_public_hex, "tx": transaction}
 
 
+# -- which banks an agent home is attached to ---------------------------------------------------
+# Local operator configuration (.singular/banks/attached.json). It is not sealed and never travels in
+# a capsule: where a bank's ciphertext lives is a fact about this machine, and grants die on sale anyway.
+
+def _attached_path(agent_home) -> Path:
+    return agent_home.sdir / "banks" / "attached.json"
+
+
+def attached_banks(agent_home) -> list[dict]:
+    try:
+        data = json.loads(_attached_path(agent_home).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [b for b in data if isinstance(b, dict) and {"bank_id", "store", "name"} <= set(b)]
+
+
+def attach_bank(agent_home, ledger: Ledger, bank_id: str, store: str | Path, name: str | None = None) -> dict:
+    record = require_bank(ledger, bank_id)
+    if record["mode"] != "external":
+        raise SingularError("internal memory is already part of the agent; attach external banks only")
+    public = json.loads(DirStore(store).get("bank.json") or b"{}")
+    if public.get("bank_id") != bank_id:
+        raise SingularError(f"{store} does not hold bank {bank_id}")
+    entry = {"bank_id": bank_id, "store": str(Path(store).resolve()), "name": name or record["name"]}
+    banks = [b for b in attached_banks(agent_home) if b["bank_id"] != bank_id and b["name"] != entry["name"]] + [entry]
+    path = _attached_path(agent_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    path.write_text(json.dumps(banks, indent=2), encoding="utf-8")
+    return entry
+
+
+def detach_bank(agent_home, bank: str) -> bool:
+    banks = attached_banks(agent_home)
+    kept = [b for b in banks if bank not in (b["bank_id"], b["name"])]
+    if len(kept) == len(banks):
+        return False
+    _attached_path(agent_home).write_text(json.dumps(kept, indent=2), encoding="utf-8")
+    return True
+
+
 # -- member side -------------------------------------------------------------------------------
 
 class BankMount:
