@@ -32,6 +32,7 @@ TRANSFER = "TRANSFER"
 ROLLBACK = "ROLLBACK"
 OWNER_ATTEST = "OWNER_ATTEST"
 RETIRE = "RETIRE"
+ROTATE_KEY = "ROTATE_KEY"
 
 # Memory banks: a memory is its own sealed object with its own single line of history.
 # An agent's internal memory is a bank bound to that agent; an external bank stands alone.
@@ -43,7 +44,7 @@ BANK_SEAL = "BANK_SEAL"
 BANK_TRANSFER = "BANK_TRANSFER"
 
 AGENT_TYPES = frozenset({REGISTER, LEASE_ACQUIRE, LEASE_RENEW, LEASE_RELEASE, LEASE_REVOKE, SEAL,
-                         ACTIONS, TRANSFER, ROLLBACK, OWNER_ATTEST, RETIRE})
+                         ACTIONS, TRANSFER, ROLLBACK, OWNER_ATTEST, RETIRE, ROTATE_KEY})
 BANK_TYPES = frozenset({BANK_CREATE, BANK_GRANT, BANK_REVOKE, BANK_REKEY, BANK_SEAL, BANK_TRANSFER})
 ALL_TYPES = AGENT_TYPES | BANK_TYPES
 

@@ -36,12 +36,12 @@ def hermes(tmp_path, chain, owner, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home.home))
     monkeypatch.setenv("HERMES_BUNDLED_PLUGINS", str(empty))
     monkeypatch.setenv("SINGULAR_PASSPHRASE", PASS)
-    monkeypatch.setattr(hermes_plugin, "_guard", None)
-    monkeypatch.setattr(hermes_plugin, "_failure", None)
+    hermes_plugin._reset_for_tests()
     manager = plugins.PluginManager()
     manager.discover_and_load()
     yield manager, home, HttpLedger(node.url)
     hermes_plugin._shutdown()
+    hermes_plugin._reset_for_tests()
     node.stop()
 
 
@@ -58,19 +58,24 @@ def test_session_takes_lease_tools_are_logged_memory_write_reseals(hermes):
     manager.invoke_hook("on_session_start", session_id="s1", model="m", platform="cli")
     assert ledger.get_agent(home.agent_id)["lease"] is not None
 
-    assert manager.invoke_hook("pre_tool_call", tool_name="terminal", args={"command": "ls"}) == [None] or \
-        not any(isinstance(r, dict) and r.get("action") == "block" for r in manager.invoke_hook("pre_tool_call", tool_name="terminal", args={}))
-    manager.invoke_hook("post_tool_call", tool_name="terminal", args={"command": "ls"}, result="a b", status="ok", session_id="s1")
+    def tool_call(name, args, result, call_id, effect=None):
+        blocked = [r for r in manager.invoke_hook("pre_tool_call", tool_name=name, args=args, tool_call_id=call_id, session_id="s1")
+                   if isinstance(r, dict) and r.get("action") == "block"]
+        assert not blocked, blocked
+        if effect:
+            effect()
+        manager.invoke_hook("post_tool_call", tool_name=name, args=args, result=result, status="ok", session_id="s1", tool_call_id=call_id)
 
-    (home.home / "memories" / "MEMORY.md").write_text("- client prefers short answers\n- learned something\n")
-    manager.invoke_hook("post_tool_call", tool_name="memory", args={"action": "add"}, result="ok", status="ok", session_id="s1")
-    assert ledger.get_bank(home.bank_id)["seal"]["seq"] == 1          # re-sealed right after the write
+    tool_call("terminal", {"command": "ls"}, "a b", "call-1")
+    tool_call("memory", {"action": "add"}, "ok", "call-2",
+              effect=lambda: (home.home / "memories" / "MEMORY.md").write_text("- client prefers short answers\n- learned something\n"))
+    assert ledger.get_bank(home.bank_id)["seal"]["seq"] == 1          # sealed right after the tool that wrote it
 
     manager.invoke_hook("on_session_end", session_id="s1")
     record = ledger.get_agent(home.agent_id)
-    assert record["actions"]["count"] == 2                              # both tool calls anchored
-    names = [r["name"] for r in hermes_plugin.current_guard().log.read()]
-    assert names == ["terminal", "memory"]
+    assert record["actions"]["count"] == 4                              # intent + result for each call, all anchored
+    kinds = [(r["kind"], r["name"]) for r in hermes_plugin.current_guard().log.read()]
+    assert kinds == [("tool.intent", "terminal"), ("tool.result", "terminal"), ("tool.intent", "memory"), ("tool.result", "memory")]
 
     hermes_plugin._shutdown()
     assert ledger.get_agent(home.agent_id)["lease"] is None and A.verify(home, ledger)["ok"]
@@ -101,8 +106,7 @@ def test_second_copy_under_hermes_is_blocked(hermes, tmp_path):
 
 def test_ordinary_hermes_home_is_untouched(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr(hermes_plugin, "_guard", None)
-    monkeypatch.setattr(hermes_plugin, "_failure", None)
+    hermes_plugin._reset_for_tests()
     assert hermes_plugin.pre_tool_call(tool_name="terminal") is None
     hermes_plugin.on_session_start(session_id="x")
     assert hermes_plugin.current_guard() is None

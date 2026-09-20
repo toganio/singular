@@ -68,3 +68,12 @@ def test_home_resolution_and_secret_lists():
 def test_memory_and_skills_still_live_where_we_seal_them():
     from hermes_cli.config import _HERMES_HOME_SUBDIRS
     assert {"memories", "skills", "cron"} <= set(_HERMES_HOME_SUBDIRS)
+
+
+def test_bundled_skills_baseline_still_resolves():
+    """Singular seals everything under skills/ that is not byte-identical to what Hermes ships (tree.resolve_baseline)."""
+    from tools import skills_sync
+    bundled = skills_sync._get_bundled_dir()
+    assert bundled.is_dir() and any(bundled.rglob("SKILL.md")), "Hermes no longer ships skills where Singular looks for them"
+    assert tree.resolve_baseline("hermes:bundled_skills") == bundled
+    assert skills_sync.MANIFEST_FILE.name == ".bundled_manifest" and ".bundled_manifest" in tree.DEFAULT_EXCLUDE

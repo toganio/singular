@@ -3,7 +3,7 @@ import shutil
 
 import pytest
 
-from conftest import PASS, make_home
+from conftest import PASS, agent_writes, make_home
 from singular import agent as A
 from singular.errors import CapsuleError, CryptoError, LeaseError, LedgerRejected, SealError
 from singular.keys import SigningKey
@@ -60,11 +60,11 @@ def test_only_one_copy_runs(agent, ledger, tmp_path):
 def test_agent_writes_to_itself_and_reseals(agent, ledger):
     guard = SingularGuard(agent, ledger, PASS, heartbeat=False)
     guard.start()
-    (agent.home / "memories" / "MEMORY.md").write_text("- client prefers short answers\n- hates jargon\n")
-    out = guard.reseal("memory write")
-    assert out["memory"] and out["core"] is None
-    (agent.home / "skills" / "review" / "SKILL.md").write_text("# review\nRead it three times.\n")
-    assert guard.reseal("skill edit")["core"]
+    agent_writes(guard, "memories/MEMORY.md", "- client prefers short answers\n- hates jargon\n")
+    assert ledger.get_bank(agent.bank_id)["seal"]["seq"] == 1 and ledger.get_agent(agent.agent_id)["seal"]["seq"] == 0
+    agent_writes(guard, "skills/review/SKILL.md", "# review\nRead it three times.\n", tool="skill_manage")
+    seal_tx = [h["tx"] for h in ledger.history(agent.agent_id) if h["tx"]["type"] == "SEAL"][-1]
+    assert seal_tx["body"]["reason"] == "action 4"          # the seal names the signed record of the action that caused it
     guard.stop()
     report = A.verify(agent, ledger)
     assert report["ok"] and report["core"]["seq"] == 1 and report["memory"]["seq"] == 1 and report["lease"] is None
@@ -75,7 +75,7 @@ def test_stale_clone_cannot_run_after_original_moved_on(agent, ledger, tmp_path)
     shutil.copytree(agent.home, clone)
     guard = SingularGuard(agent, ledger, PASS, heartbeat=False)
     guard.start()
-    (agent.home / "memories" / "MEMORY.md").write_text("- newer\n")
+    agent_writes(guard, "memories/MEMORY.md", "- newer\n")
     guard.stop()
     with pytest.raises(SealError):
         SingularGuard(clone, ledger, PASS, heartbeat=False).start()
@@ -89,7 +89,7 @@ def test_actions_are_logged_signed_and_anchored(agent, ledger):
         guard.record_action("tool", "send_email", {"to": "a@b.c", "i": i}, {"ok": True}, summary="sent")
     guard.stop()
     record = ledger.get_agent(agent.agent_id)
-    assert record["actions"]["count"] == 3
+    assert record["actions"]["count"] == 6             # 3 signed intents + 3 signed results
     log = guard.log.read()
     assert verify_log(log, {0: record["agent_pub"]}) == record["actions"]["head"]
     log[1]["summary"] = "edited after the fact"
@@ -207,7 +207,7 @@ def test_sale_capsule_carries_no_key_and_no_private_history(agent, ledger, owner
     g.record_action("tool", "first_under_new_owner", {}, {})
     g.stop()
     record = ledger.get_agent(agent.agent_id)
-    assert record["actions"]["count"] == 2 and g.log.read()[0]["n"] == 2 and g.log.read()[0]["epoch"] == 1
+    assert record["actions"]["count"] == 4 and g.log.read()[0]["n"] == 3 and g.log.read()[0]["epoch"] == 1
 
 
 def test_moving_your_own_agent_keeps_key_and_history(agent, ledger, tmp_path):

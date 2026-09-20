@@ -19,9 +19,9 @@ through Hermes' official plugin entry point. New Hermes releases are merged auto
 |---|---|
 | **Unique identity** | `sng1…` id derived from the genesis keys; name and function registered on the ledger |
 | **Runs in one place** | a *run lease* on the ledger, bound to a fresh per-process host key; no lease → every tool call is blocked |
-| **No outside additions** | the agent's files hash to a sealed root; a changed or stale copy cannot take the lease |
+| **No outside additions** | the agent's files hash to a sealed root; a changed or stale copy cannot take the lease; while running, any change made outside the agent's own actions stops it before the next action |
 | **Grows from the inside** | when the running agent writes memory or skills, Singular re-seals (`seq+1`, must name the previous root) |
-| **Liability record** | every tool call → signed, hash-chained action log; heads anchored on the ledger, content stays private |
+| **Liability record** | a signed intent is on disk *before* each tool runs, a signed result after; hash-chained, anchored on the ledger every few seconds, content stays private |
 | **Movable & sellable** | encrypted capsule + 3-signature `TRANSFER`; the agent key rotates, the seller's copy is dead |
 | **Singular memory** | internal memory travels with the agent; external **memory banks** are shared, encrypted, single-history, per-agent grants (read / read-write / rented), every write attributed |
 | **Auditable** | hash-linked, validator-signed blocks; `singular ledger audit` replays every rule from genesis |
@@ -84,7 +84,7 @@ See it all break-tested in one go: `python -m singular.demo` (17 scenarios again
 
 ## What is sealed
 
-* **core** – `SOUL.md`, `profile.yaml`, `skills/`, `cron/jobs.json`
+* **core** – `SOUL.md`, `profile.yaml`, and everything under `skills/` that is not byte-identical to what the installed Hermes ships (the agent's own and modified skills)
 * **internal memory** – `memories/`
 * **never** – `.env`, `auth.json`, vault files, session databases (secrets belong to the operator, not
   the agent), and `config.yaml` (a buyer must be able to point the agent at their own model provider).

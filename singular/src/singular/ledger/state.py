@@ -355,6 +355,19 @@ class LedgerState:
         agent.update(owner_pub=new_owner, agent_pub=new_agent, enc_pub=_pub(body["new_enc_pub"], "new_enc_pub"), lease=None,
                      epoch=agent["epoch"] + 1, transfers=agent["transfers"] + 1)
 
+    def _rotate_key(self, agent: dict, tx: dict, now_ms: int) -> None:
+        """The agent key leaked (or might have): the owner replaces it without selling. Works even while a
+        lease is held, because the holder of that lease may be the thief; the lease is dropped, the epoch
+        moves (so bank grants wrapped to the old key are void), and the old key is dead from this block on."""
+        body = tx["body"]
+        T.require_fields(body, ["new_agent_pub", "new_enc_pub"])
+        new_agent = _pub(body["new_agent_pub"], "new_agent_pub")
+        if new_agent in (agent["agent_pub"], agent["owner_pub"]):
+            _reject("BAD_BODY", "the new agent key must be a fresh key")
+        T.require_signers(tx, self.chain_id, {"owner": agent["owner_pub"], "new_agent": new_agent})
+        agent.update(agent_pub=new_agent, enc_pub=_pub(body["new_enc_pub"], "new_enc_pub"), lease=None,
+                     epoch=agent["epoch"] + 1, rotations=agent.get("rotations", 0) + 1)
+
     def _retire(self, agent: dict, tx: dict, now_ms: int) -> None:
         T.require_fields(tx["body"], [])
         T.require_signers(tx, self.chain_id, {"owner": agent["owner_pub"]})

@@ -25,6 +25,37 @@
   verifying replica (`singular ledger audit`, `Chain.replica`).
 * The **descriptor (name, function) is public and permanent.** Do not put personal data in it.
 
+## What the running agent enforces on itself (v0.2 hardening)
+
+* **Nothing changes while it is idle.** Sealed files may change only inside an action the agent itself opened. Before every
+  action the guard compares the files to the last sealed state; if they differ and no action is open, someone else wrote to the
+  agent: it stops acting, seals nothing, anchors its honest records, releases the lease, and refuses to start again until
+  `singular restore`. A change made inside an action is sealed right after it, in a transaction that names that action's record.
+* **No unrecorded action.** A signed *intent* record is on disk before a tool runs; if it cannot be written the tool is blocked.
+  A signed *result* record follows. Pending records are anchored every few seconds, on shutdown, and by the next run after a crash.
+  A local log shorter than what the ledger anchored marks a stale or truncated copy, which cannot start.
+* **The lease clock cannot be forged.** The guard acts only during the first 90 % of a lease, measured on the machine's
+  boot-time clock (which counts suspend and cannot be set back) from the moment the request *left*, never from the wall clock.
+* **The ledger is not trusted blindly.** The guard pins the last block it saw (`.singular/ledger-head.json`) and refuses a node
+  that shows a shorter history ("went backwards") or a different block at the pinned height ("rewrote history").
+* **A leaked agent key can be replaced without a sale.** `singular owner rotate-key` (`ROTATE_KEY`): the old key is dead from that
+  block on, even if the thief is running the agent at that moment; bank grants wrapped to the old key are void.
+* **Shipped software is not identity.** Under `skills/`, the seal covers every file that is not byte-identical to the file the
+  installed Hermes ships at the same path. Hermes updates can refresh shipped skills without breaking the seal; altering one by
+  a single byte puts it under the seal and is caught like any other outside edit.
+
+What remains true after all that:
+
+* An attacker who can write to the disk *during* one of the agent's own tool calls can hide a change inside that window; it will
+  be sealed, attributed to that action's signed record. Closing this needs OS-level isolation (one user / container per agent),
+  which hosting provides and a shared workstation does not.
+* Deleting a *pristine shipped* skill file is not noticed (it was never under the seal; Hermes restores it on next sync).
+* The ledger pin defends against the ledger, not against someone with write access to the agent's own disk, who can delete it.
+* Hermes' optional "staged memory writes" (`/memory approve`) apply changes outside any tool call. Under Singular that is an
+  outside edit by design: keep that Hermes option off for Singular agents.
+* The trust boundary is the installed software. Someone who can replace Hermes or Singular on the machine owns that run; the
+  ledger still prevents them from running a second instance or rewriting what was already recorded.
+
 ## Who we defend against, and how
 
 | Attacker | Wants | Stopped by |
@@ -33,6 +64,9 @@
 | Owner (or ex-employee) with the passphrase, running a second copy | two instances | `LEASE_ACQUIRE` fails while a lease is live; lease is bound to a per-process host key, so holding the agent key is not enough to seal, anchor, renew or release |
 | Same, using an old backup after the agent moved on | roll the agent back quietly | acquiring the lease requires the *current* sealed core and memory roots; stale copy → `STALE_STATE` |
 | Anyone with disk access while the agent is stopped | plant a skill / memory | full re-hash at every start; mismatch → refuses to start, every tool blocked |
+| Anyone with disk access while the agent is **running** | slip a change in and let the agent seal it as its own | idle-drift check before every action (ctime-keyed cache: a forged mtime does not hide an in-place edit); drift → no actions, no seals |
+| Thief who has the files **and** the passphrase | impersonate the agent | owner rotates the key (`ROTATE_KEY`); the thief's running instance loses the lease in the same block |
+| Ledger operator / host | rewrite or truncate history | pinned head continuity check at start, on every renewal and at shutdown |
 | Seller after a sale | keep using the agent | `TRANSFER` replaces the agent key; old key and old owner key are rejected from that block on |
 | Buyer before paying / before transfer | act as the agent under the seller's name | sale capsules carry **no agent key** and no private action records |
 | Malicious capsule | write outside the target, plant secrets, smuggle links | hand-rolled extraction: regular files + in-home symlinks only, no traversal, no writes through links, no secret filenames, size/member caps; then a full verify against the ledger |

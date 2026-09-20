@@ -18,6 +18,11 @@ Normative for the reference implementation in `singular/src/singular`. Rule code
 
 ## 3. Sealed state
 
+**Baselines.** An identity may list `baselines: [{prefix, source}]`. A regular file under `prefix` that is byte-identical to the
+file the installed software ships at the same relative path under `source` is not an entry. v1 defines one source,
+`hermes:bundled_skills`. Shipped-but-modified files and everything the agent authored are entries like any other.
+
+
 `entry = {p, h, s}` for files, `{p, l}` for in-home symlinks (never followed; out-of-home links are refused).
 `root = merkle(hash(entry) for entries sorted by p)`. An agent has two roots: **core** and **internal memory**.
 
@@ -41,6 +46,7 @@ of signer roles below must be present, no more, no fewer. "now" is the enclosing
 | `TRANSFER` | owner, new_owner, new_agent | no live lease; buyer names current `root` + `memory_root` | owner/agent/enc keys replaced, `epoch+1` (voids bank grants) |
 | `ROLLBACK` | owner | no live lease; target root was sealed before | new seal, kind `rollback` |
 | `OWNER_ATTEST` | owner | no live lease; policy `allow_owner_attest` | new seal, kind `owner_attest` |
+| `ROTATE_KEY` | owner, new_agent | new key is fresh (works even while a lease is held: the holder may be the thief) | agent/enc keys replaced, lease dropped, `epoch+1`, `rotations+1` |
 | `RETIRE` | owner | — | agent frozen forever |
 | `BANK_CREATE` | owner | id matches; nonce 1 | external bank, key_gen 1 |
 | `BANK_GRANT` | bank owner | external; agent active; `key_gen` current | grant `{rights r\|rw, epoch, key_gen, wrapped_key, expires}` |
@@ -60,7 +66,18 @@ previous block was being written goes into the next one), and each transaction i
 Genesis (`height 0`, `prev = 0…0`, unsigned) carries `params = {name, validators, protocol}`; **its hash is the chain id**,
 which agents pin in `identity.json` and which every transaction signature binds.
 
+## 5a. What a client must check about its node
+
+A client keeps a pinned head `{height, hash}` of the last block it saw and, at start, on every lease renewal and at shutdown,
+requires `info.height >= pinned.height` and `block_hash_at(pinned.height) == pinned.hash` before updating the pin.
+
 ## 6. Action records (off-chain, anchored)
+
+Each action is two records: `kind = "<k>.intent"` (status `started`, written and fsynced **before** the action runs) and
+`kind = "<k>.result"` (its `input` hashes `{"intent": n}`). A `SEAL`/`BANK_SEAL` caused by an action carries
+`reason = "action <n>"` naming the result record. Runtime rule (not consensus): with no intent open, the files must equal the last
+sealed roots, or the runtime stops acting. The lease window is `0.9 × ttl` on a boot-time clock, counted from request send.
+
 
 `{v,n,prev,agent,epoch,lease,ts,kind,name,status,input:H,output:H,summary,session,sig}` — `prev` is the hash of the
 previous record (without `sig`), signature domain `singular-action:v1:`. `ACTIONS` anchors `(first,last,prev_head,head,batch_root)`.
