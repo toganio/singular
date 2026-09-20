@@ -28,6 +28,9 @@ concurrency:
 
 env:
   UPSTREAM: NousResearch/hermes-agent
+  # This repo is a fork. Without an explicit repo, `gh pr` / `gh issue` resolve to the PARENT
+  # (Hermes) and would open our sync PR over there. Every gh call below is pinned to us.
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   sync:
@@ -55,7 +58,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "base=$base" >> "$GITHUB_OUTPUT"
           if [ "$tag" = "$base" ]; then echo "needed=false" >> "$GITHUB_OUTPUT"; echo "already on $tag";
-          elif gh pr list --head "upstream-sync/$tag" --state open --json number -q '.[0].number' | grep -q .; then
+          elif gh pr list -R "$GH_REPO" --head "upstream-sync/$tag" --state open --json number -q '.[0].number' | grep -q .; then
             echo "needed=false" >> "$GITHUB_OUTPUT"; echo "sync PR for $tag is already open";
           else echo "needed=true" >> "$GITHUB_OUTPUT"; fi
       - name: Merge the release on a branch
@@ -88,7 +91,7 @@ jobs:
           TAG: ${{ steps.target.outputs.tag }}
           BASE: ${{ steps.target.outputs.base }}
         run: |
-          url=$(gh pr create --base main --head "upstream-sync/$TAG" --title "sync: Hermes Agent $TAG" \
+          url=$(gh pr create -R "$GH_REPO" --base main --head "upstream-sync/$TAG" --title "sync: Hermes Agent $TAG" \
             --body "Automated sync from \`$BASE\` to \`$TAG\` (https://github.com/$UPSTREAM/releases/tag/$TAG).
 
           \`singular-ci\` runs the Hermes contract test, the integration tests and the end-to-end demo on this Hermes.
@@ -96,14 +99,14 @@ jobs:
           adapt \`singular/src/singular/hermes_plugin.py\` on this branch.
 
           **Merge with a merge commit, never squash.**")
-          gh pr merge "$url" --auto --merge
+          gh pr merge "$url" -R "$GH_REPO" --auto --merge
       - name: Report a merge conflict
         if: steps.target.outputs.needed == 'true' && steps.merge.outputs.conflict == 'true'
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
           TAG: ${{ steps.target.outputs.tag }}
         run: |
-          gh issue create --title "Hermes $TAG does not merge cleanly" \
+          gh issue create -R "$GH_REPO" --title "Hermes $TAG does not merge cleanly" \
             --body "Conflicting files:
           \`\`\`
           $(cat /tmp/conflicts.txt)
