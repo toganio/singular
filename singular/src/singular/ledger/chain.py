@@ -107,11 +107,31 @@ def verify_chain(blocks: Iterable[dict], expected_chain_id: str | None = None) -
     return state, header
 
 
+class _Pending:
+    """One caller waiting for its transaction to land (or be refused)."""
+
+    __slots__ = ("tx", "done", "receipt", "error")
+
+    def __init__(self, tx: dict):
+        self.tx, self.done, self.receipt, self.error = tx, threading.Event(), None, None
+
+    def succeed(self, receipt: dict) -> None:
+        self.receipt = receipt
+        self.done.set()
+
+    def fail(self, error: BaseException) -> None:
+        self.error = error
+        self.done.set()
+
+
 class Chain:
     """A block-producing (or read-only) node's view of the chain, stored in SQLite."""
 
     def __init__(self, path: str | Path, validator_key: SigningKey | None = None):
         self._lock = threading.RLock()
+        self._queue_lock = threading.Lock()
+        self._queue: list[_Pending] = []
+        self._producing = False
         self._key = validator_key
         self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -173,45 +193,82 @@ class Chain:
     # -- writing ---------------------------------------------------------------------------
 
     def submit(self, tx: dict) -> dict:
-        """Validate a transaction and, if it passes, seal it into a new block right away."""
+        """Validate a transaction and return its receipt once it is sealed into a block.
+
+        Group commit: callers queue up while a block is being written to disk, and everything that
+        queued in the meantime goes into the *next* block together. A quiet node still answers at once
+        (one transaction, one block); a busy node packs up to ``MAX_TXS_PER_BLOCK`` per block instead of
+        paying one fsync per heartbeat. Each transaction is still judged alone: a bad one is refused and
+        its neighbours in the batch are unaffected.
+        """
         if self._key is None:
             raise LedgerRejected("READ_ONLY", "this node does not produce blocks")
+        T.check_shape(tx)
+        slot = _Pending(tx)
+        with self._queue_lock:
+            self._queue.append(slot)
+            leader = not self._producing
+            if leader:
+                self._producing = True
+        if leader:
+            try:
+                while True:
+                    with self._queue_lock:
+                        batch, self._queue = self._queue[:MAX_TXS_PER_BLOCK], self._queue[MAX_TXS_PER_BLOCK:]
+                        if not batch:
+                            self._producing = False
+                            break
+                    self._produce(batch)
+            except BaseException:
+                with self._queue_lock:
+                    self._producing = False
+                raise
+        slot.done.wait()
+        if slot.error is not None:
+            raise slot.error
+        return slot.receipt
+
+    def _produce(self, batch: list["_Pending"]) -> None:
         with self._lock:
             height = self.head["height"] + 1
             if expected_validator(self.validators, height) != self._key.public_hex:
-                raise LedgerRejected("NOT_MY_TURN", "another validator produces the next block")
+                for slot in batch:
+                    slot.fail(LedgerRejected("NOT_MY_TURN", "another validator produces the next block"))
+                return
             ts = max(now_ms(), self.head["ts"] + 1)
-            T.check_shape(tx)
-            subject = tx["subject"]
-            before = (self.state.agents.get(subject), self.state.banks.get(subject),
-                      dict(self.state._hashes), dict(self.state.banks))
+            # apply() replaces records instead of mutating them, so shallow copies are a full undo log
+            undo = (dict(self.state.agents), dict(self.state.banks), dict(self.state._hashes))
+            accepted: list[_Pending] = []
+            for slot in batch:
+                try:
+                    self.state.apply(slot.tx, ts)
+                    accepted.append(slot)
+                except LedgerRejected as exc:
+                    slot.fail(exc)
+                except Exception as exc:  # noqa: BLE001 - a malformed body must not take the batch down
+                    slot.fail(LedgerRejected("BAD_TX", f"could not be applied: {type(exc).__name__}"))
+            if not accepted:
+                return
             try:
-                self.state.apply(tx, ts)
-                header = {"height": height, "prev": block_hash(self.head), "ts": ts,
-                          "tx_root": merkle_root([T.txid(tx, self.chain_id)]),
+                txs = [slot.tx for slot in accepted]
+                ids = [T.txid(t, self.chain_id) for t in txs]
+                header = {"height": height, "prev": block_hash(self.head), "ts": ts, "tx_root": merkle_root(ids),
                           "state_root": self.state.root(), "validator": self._key.public_hex}
-                block = {"header": header, "sig": self._key.sign(_BLOCK_DOMAIN + canonical(header)), "txs": [tx]}
-                tid = T.txid(tx, self.chain_id)
+                block = {"header": header, "sig": self._key.sign(_BLOCK_DOMAIN + canonical(header)), "txs": txs}
                 self._db.execute("BEGIN IMMEDIATE")
                 self._db.execute("INSERT INTO blocks VALUES (?, ?, ?)", (height, block_hash(header), canonical(block).decode()))
-                self._db.execute("INSERT INTO txs VALUES (?, ?, ?)", (tid, height, subject))
+                self._db.executemany("INSERT INTO txs VALUES (?, ?, ?)", [(i, height, t["subject"]) for i, t in zip(ids, txs)])
                 self._db.execute("COMMIT")
-            except BaseException:
+            except Exception:  # noqa: BLE001 - disk trouble: undo the whole batch, tell every caller
                 if self._db.in_transaction:
                     self._db.execute("ROLLBACK")
-                self._restore(subject, before)
-                raise
+                self.state.agents, self.state.banks, self.state._hashes = undo
+                for slot in accepted:
+                    slot.fail(LedgerRejected("UNAVAILABLE", "the block could not be written"))
+                return
             self.head = header
-            return {"txid": tid, "height": height, "block": block_hash(header), "ts": ts}
-
-    def _restore(self, subject: str, before: tuple) -> None:
-        agent, bank, hashes, banks = before
-        if agent is None:
-            self.state.agents.pop(subject, None)
-        else:
-            self.state.agents[subject] = agent
-        self.state.banks = banks
-        self.state._hashes = hashes
+            for slot, tid in zip(accepted, ids):
+                slot.succeed({"txid": tid, "height": height, "block": block_hash(header), "ts": ts})
 
     def append_verified(self, block: dict) -> None:
         """Replica path: verify a block produced elsewhere and store it. On any failure the

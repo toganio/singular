@@ -49,6 +49,12 @@ lease deadline (minus the skew margin) passes. If the ledger reports that the ag
 without this process (`NONCE_CONFLICT` with someone else's lease, `NO_LEASE`, `LEASE_EXPIRED`), the guard
 marks itself lost and never recovers within that process.
 
+## Operating notes
+
+Default run-lease lifetime is 10 minutes (renewed every ~3). A crashed host therefore frees its agent within 10 minutes on its
+own; the owner can free it immediately with `singular owner revoke-lease`. Shorter lifetimes are a per-agent choice at
+registration (`--lease-ttl`), paid for in ledger traffic.
+
 ## Known gaps (tracked for v0.2)
 
 1. Per-agent `roots` history grows without bound in ledger state.
