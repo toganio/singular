@@ -1,0 +1,48 @@
+name: singular-ci
+
+# Singular's own test lane. Hermes' workflows are disabled on this fork (repo setting, files untouched).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: singular-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Hermes (the version on this branch) and Singular
+        run: |
+          uv venv .venv-ci
+          uv pip install --python .venv-ci/bin/python -e .
+          uv pip install --python .venv-ci/bin/python -e "./singular[dev]"
+      - name: Singular tests (Hermes contract + integration must run, not skip)
+        env:
+          SINGULAR_REQUIRE_HERMES: "1"
+        run: |
+          cd singular
+          ../.venv-ci/bin/python -m pytest tests -q -rs
+      - name: End-to-end demo against a real HTTP ledger node
+        run: .venv-ci/bin/python -m singular.demo
+      - name: Singular touches no Hermes file
+        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'upstream-sync/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          changed=$(gh pr view "${{ github.event.pull_request.number }}" -R "${{ github.repository }}" --json files -q '.files[].path' \
+            | grep -Ev '^(singular/|docs/singular/|docs/evaluations/singular-|\.github/workflows/singular-)' || true)
+          if [ -n "$changed" ]; then echo "::error::files outside Singular's folders changed:"; echo "$changed"; exit 1; fi

@@ -1,0 +1,10 @@
+# never commit keys, capsules, chains or working copies
+*.keystore.json
+*.capsule
+*.db
+*.db-wal
+*.db-shm
+.singular/
+__pycache__/
+*.egg-info/
+.pytest_cache/
