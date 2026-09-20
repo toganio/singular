@@ -186,6 +186,11 @@ def cmd_owner_action(args) -> int:
     return 0
 
 
+def cmd_prove(args) -> int:
+    _print(A.prove_ownership(_owner_key(args), args.agent, args.challenge, args.site))
+    return 0
+
+
 def cmd_history(args) -> int:
     ledger = open_ledger(args.ledger)
     _print([{"height": h["height"], "ts": h["ts"], "type": h["tx"]["type"], "txid": h["txid"],
@@ -297,6 +302,10 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p.add_argument("action", choices=["revoke-lease", "retire", "rollback", "attest"])
     p.add_argument("--root")
     p.add_argument("--reason", default="owner edit")
+    p = add("prove", cmd_prove, "prove to a service that you own an agent (signs a one-time challenge locally)", owner=True)
+    p.add_argument("--agent", required=True)
+    p.add_argument("--challenge", required=True)
+    p.add_argument("--site", required=True, help="the service asking, exactly as it printed it")
     p = add("history", cmd_history, "audit trail of an agent or bank", ledger=True)
     p.add_argument("id")
 

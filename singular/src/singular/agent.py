@@ -291,6 +291,26 @@ def owner_attest(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, r
     return receipt
 
 
+# -- proving ownership to a third party ---------------------------------------------------------
+
+_LINK_DOMAIN = b"singular-link:v1:"
+
+
+def prove_ownership(owner_key: SigningKey, agent_id: str, challenge: str, site: str) -> dict:
+    """Answer a one-time challenge from a service (for example a hosting dashboard) that wants to know you
+    own an agent. The owner key signs locally; only the signature leaves this machine. The service checks it
+    against the owner key the *ledger* names, so this proves current ownership and nothing else. ``site`` is
+    part of the signed message, so a proof made for one service cannot be replayed at another."""
+    import re
+    if not re.fullmatch(r"sng1[a-z2-7]{20,40}", agent_id) or not re.fullmatch(r"[a-f0-9]{64}", challenge) \
+            or not re.fullmatch(r"[A-Za-z0-9.:-]{1,253}", site):
+        raise SingularError("agent id, challenge or site has an unexpected shape; copy the command exactly")
+    from .canonical import canonical
+    message = _LINK_DOMAIN + canonical({"agent": agent_id, "challenge": challenge, "site": site})
+    return {"agent": agent_id, "challenge": challenge, "site": site, "owner_pub": owner_key.public_hex,
+            "sig": owner_key.sign(message)}
+
+
 # -- moving and selling ------------------------------------------------------------------------
 
 def export_capsule(agent_home: AgentHome, ledger: Ledger, out_path: Path, capsule_passphrase: str, *,
