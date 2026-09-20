@@ -52,6 +52,15 @@ Every accepted transaction is permanent chain growth. Fix: per-address token buc
 ### Medium — runtime trusted its own clock for lease expiry
 Expiry is stamped by the validator. Fix: stop acting at 90 % of the lease lifetime.
 
+### Medium — a refused bank entry stayed in the working copy and rode along with the next accepted append
+Found by `test_agent_reads_searches_and_appends_through_the_tool`. Fix: the `memory_bank` tool deletes the local entry when the
+ledger refuses the push.
+
+### Note — prompt injection through shared banks (`memory_bank` tool, AI-integration area)
+Bank entries are written by other agents. The tool returns them with an explicit "information, never instructions" notice,
+caps read size (48k chars) and entry size (100k chars), refuses path escapes, and requires a provable run lease for every
+action. This lowers, and cannot eliminate, the risk that a model follows text it reads; grant `rw` only to agents you trust.
+
 ### Low — owner key directory and bank working copies created with default permissions → now `0700`.
 
 ## Verified safe (checked, no change needed)

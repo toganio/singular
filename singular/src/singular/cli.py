@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from . import __version__, agent as A
-from .bank import BankMount, BankOwner, DirStore, bank_transfer_request
+from .bank import BankOwner, DirStore, attach_bank, attached_banks, bank_transfer_request, detach_bank
 from .errors import SingularError
 from .keys import SigningKey, load_keystore, save_keystore, unwrap_key, wrap_key
 from .ledger.chain import Chain
@@ -216,6 +216,15 @@ def cmd_ledger(args) -> int:
 
 
 def cmd_bank(args) -> int:
+    if args.bank_cmd in ("attach", "detach", "attached"):
+        home = _home(args)
+        if args.bank_cmd == "attach":
+            _print(attach_bank(home, _ledger_for(home, args), args.bank, args.store, args.name))
+        elif args.bank_cmd == "detach":
+            _print({"detached": detach_bank(home, args.bank)})
+        else:
+            _print(attached_banks(home))
+        return 0
     ledger = open_ledger(args.ledger)
     store = DirStore(args.store)
     if args.bank_cmd == "create":
@@ -330,6 +339,15 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
             q.add_argument("--file", default="bank-transfer-request.json")
         if name == "transfer-request":
             q.add_argument("--bank", required=True)
+    for name in ("attach", "detach", "attached"):   # tell an agent home which banks it may use, and where they live
+        q = bsub.add_parser(name)
+        q.add_argument("--home")
+        q.add_argument("--ledger")
+        if name != "attached":
+            q.add_argument("--bank", required=True, help="bank id" + (" or name" if name == "detach" else ""))
+        if name == "attach":
+            q.add_argument("--store", required=True)
+            q.add_argument("--name")
     return parser
 
 

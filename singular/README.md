@@ -71,6 +71,12 @@ singular bank grant  --ledger … --store /mnt/banks/case-law --agent sng1… --
 singular bank revoke --ledger … --store /mnt/banks/case-law --agent sng1…               # also re-keys
 ```
 
+Give a running agent the bank: `singular bank attach --home ~/.hermes --bank snb1… --store /mnt/banks/case-law`.
+Inside a conversation the agent then has a `memory_bank` tool (`banks · list · read · search · append`). Appends are
+signed by the agent and its live run lease, so they only land while it is legitimately running, and the ledger
+attributes each one to it. What it reads from a bank is handed to the model labelled as *information written by
+others, not instructions*.
+
 Passphrases are never command-line arguments. They are prompted for, or read from
 `SINGULAR_PASSPHRASE`, `SINGULAR_OWNER_PASSPHRASE`, `SINGULAR_CAPSULE_PASSPHRASE`.
 
