@@ -329,3 +329,44 @@ def test_node_can_require_a_token_to_register(chain):
         assert code(e) == "BAD_TX"
     finally:
         node.stop()
+
+
+def test_busy_node_packs_many_transactions_into_few_blocks(chain):
+    """Group commit: 40 agents heartbeat at once; every one gets its receipt, a bad one does not hurt its neighbours."""
+    import threading
+    agents = []
+    for _ in range(40):
+        aid, _, agent = register(chain)
+        agents.append((aid, agent, lease(chain, aid, agent)))
+    start_height = chain.head["height"]
+    receipts, errors, gate = [], [], threading.Barrier(41)
+
+    def renew(aid, agent, host):
+        t = T.build(T.LEASE_RENEW, aid, chain.state.agents[aid]["nonce"] + 1, {})
+        T.sign(t, chain.chain_id, "agent", agent), T.sign(t, chain.chain_id, "host", host)
+        gate.wait()
+        try:
+            receipts.append(chain.submit(t))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def bad():
+        aid, agent, _ = agents[0]
+        t = T.build(T.LEASE_RENEW, aid, 999, {})
+        T.sign(t, chain.chain_id, "agent", agent), T.sign(t, chain.chain_id, "host", SigningKey.generate())
+        gate.wait()
+        try:
+            chain.submit(t)
+        except LedgerRejected as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=renew, args=a) for a in agents] + [threading.Thread(target=bad)]
+    [t.start() for t in threads]
+    [t.join(timeout=30) for t in threads]
+    assert len(receipts) == 40 and len(errors) == 1 and errors[0].code == "NONCE_CONFLICT"
+    blocks_used = chain.head["height"] - start_height
+    assert blocks_used < 40, f"expected batching, got {blocks_used} blocks for 40 transactions"
+    assert len({r["txid"] for r in receipts}) == 40
+    # and the batched chain still replays from genesis to the same state
+    state, head = verify_chain(chain.blocks(0, 500), chain.chain_id)
+    assert state.root() == chain.state.root() and head == chain.head

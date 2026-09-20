@@ -28,7 +28,9 @@ from .ledger import tx as T
 from .ledger.client import Ledger
 
 KEEP_SNAPSHOTS = 5
-DEFAULT_LEASE_TTL_MS = 120_000
+# A running agent renews at a third of this. Ten minutes keeps a busy ledger quiet (one renewal per agent every ~3 min)
+# while a crashed host still frees the agent without the owner lifting a finger. Owners can always revoke at once.
+DEFAULT_LEASE_TTL_MS = 600_000
 
 
 def default_owner_dir() -> Path:

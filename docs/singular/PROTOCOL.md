@@ -55,7 +55,8 @@ Rejection codes are stable strings (`LEASE_HELD`, `STALE_STATE`, `NONCE_CONFLICT
 
 `header = {height, prev, ts, tx_root, state_root, validator}`; block hash = `H(canonical header)`;
 signature over `"singular-block:v1:" ‖ canonical(header)` by `validators[height mod n]` from genesis.
-`ts` strictly increases. `state_root` = Merkle root over every agent and bank record by id.
+`ts` strictly increases. A block carries 1 to 256 transactions; the reference node group-commits (whatever queued while the
+previous block was being written goes into the next one), and each transaction is accepted or refused on its own. `state_root` = Merkle root over every agent and bank record by id.
 Genesis (`height 0`, `prev = 0…0`, unsigned) carries `params = {name, validators, protocol}`; **its hash is the chain id**,
 which agents pin in `identity.json` and which every transaction signature binds.
 

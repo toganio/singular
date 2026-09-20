@@ -282,7 +282,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p.add_argument("--home", required=True)
     p.add_argument("--name", required=True)
     p.add_argument("--function", required=True, help="what this agent is for (public, permanent)")
-    p.add_argument("--lease-ttl", type=int, default=120, help="seconds a run lease lives without a heartbeat")
+    p.add_argument("--lease-ttl", type=int, default=600, help="seconds a run lease lives without a heartbeat")
     p.add_argument("--allow-owner-edits", action="store_true", help="permit owner-attested manual edits (recorded on the ledger)")
     add("status", cmd_status, "verify files against the ledger", home=True)
     add("verify", cmd_status, "alias of status", home=True)
