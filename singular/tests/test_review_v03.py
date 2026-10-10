@@ -312,3 +312,28 @@ def test_stop_releases_the_lease_even_when_anchoring_fails(agent, ledger, monkey
     monkeypatch.setattr(guard, "anchor_actions", lambda: (_ for _ in ()).throw(LedgerRejected("ACTION_FORK")))
     guard.stop()
     assert ledger.get_agent(agent.agent_id)["lease"] is None
+
+
+# -- M5: an honest bank client never erases another member's entries -----------------------------------
+
+def test_a_bank_member_cannot_erase_another_members_entries_through_the_client(agent, ledger, owner, tmp_path):
+    from singular.bank import BankMount, BankOwner, DirStore
+    from singular.errors import SingularError
+    eve = A.init_agent(make_home(tmp_path / "eve"), ledger, "local", owner, PASS, name="Eve", function="x")
+    bank = BankOwner.create(DirStore(tmp_path / "store"), ledger, SigningKey.generate(), "b")
+    bank.grant(agent.agent_id, "rw")
+    bank.grant(eve.agent_id, "rw")
+    ga, ge = (SingularGuard(h, ledger, PASS, heartbeat=False) for h in (agent, eve))
+    ga.start(), ge.start()
+    ma = BankMount(bank.store, ledger, bank.bank_id, tmp_path / "ma", agent_id=ga.agent_id, agent_key=ga.agent_key)
+    me = BankMount(bank.store, ledger, bank.bank_id, tmp_path / "me", agent_id=ge.agent_id, agent_key=ge.agent_key)
+    ma.append_entry("Ada's finding")
+    ma.push(ga.signers())
+    me.pull()
+    shutil.rmtree(me.files / "entries" / agent.agent_id)
+    with pytest.raises(SingularError, match="writes only under"):
+        me.push(ge.signers())
+    assert ledger.get_bank(bank.bank_id)["seal"]["by"] == agent.agent_id
+    me = BankMount(bank.store, ledger, bank.bank_id, tmp_path / "me2", agent_id=ge.agent_id, agent_key=ge.agent_key)
+    me.append_entry("Eve's note")                                     # her own entries still go through
+    assert me.push(ge.signers()) and ma.pull()["updated"] == 1 and len(ma.list()) == 2

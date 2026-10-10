@@ -422,8 +422,18 @@ class BankMount:
             _, bank, manifest, keys = self._pull()
             gen = bank["key_gen"]
             known = {e["h"]: e for e in manifest["entries"]}
+            local = self._scan()
+            if writer != OWNER_WRITER:
+                # Members write append-only, under their own name. The ledger cannot see paths (it holds one root), so a
+                # hostile client can still skip this; the old state then survives in the earlier manifest and the ledger
+                # names who sealed the erasing one. An honest client never erases another member's entries.
+                own = f"entries/{writer}/"
+                change = tree.diff(_public_entries(manifest["entries"]), local)
+                foreign = [p for p in change["added"] + change["changed"] + change["removed"] if not p.startswith(own)]
+                if foreign:
+                    raise SingularError(f"a bank member writes only under {own}; refusing to change {foreign[:3]}")
             entries = []
-            for entry in self._scan():
+            for entry in local:
                 if entry["h"] in known:
                     entries.append({**entry, "b": known[entry["h"]]["b"], "g": known[entry["h"]]["g"]})
                     continue
