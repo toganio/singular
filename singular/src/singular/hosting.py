@@ -110,6 +110,7 @@ class Reporter:
         print(f"singular-host: {state} " + json.dumps(fields, sort_keys=True, default=str), file=sys.stderr)
         if not self.url:
             return
+        fields = {k: (v[:1500] + "…" if isinstance(v, str) and len(v) > 1500 else v) for k, v in fields.items()}
         body = json.dumps({"state": state, "ts": int(time.time() * 1000), **fields}, default=str).encode()
         request = urllib.request.Request(self.url, data=body, method="POST",
                                          headers={"Content-Type": "application/json"})

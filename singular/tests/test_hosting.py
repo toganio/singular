@@ -317,3 +317,9 @@ def test_hermes_hard_exit_still_seals_and_releases(world):
     assert out.returncode == 7, out.stderr
     assert "after 7" in out.stdout and "sealed and released" in out.stderr
     assert ledger.get_agent(agent.agent_id)["lease"] is None
+
+
+def test_reports_stay_small_whatever_the_error_says():
+    collector = Collector()
+    hosting.Reporter(collector.url, "t")("failed", detail="x" * 50_000)
+    assert len(collector.events[-1]["detail"]) <= 1501
