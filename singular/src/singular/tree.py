@@ -119,33 +119,25 @@ class HashCache:
     Keyed on (size, mtime_ns, ctime_ns, inode). ``ctime`` is the part that matters: ``utime()`` can forge
     mtime after an in-place edit, but nothing short of changing the system clock can set ctime back. It is
     still only a performance hint, so every trust decision (startup, import, transfer) hashes in full.
+
+    Held in memory only, for the life of one process. A cache on disk sits beside the files it vouches for, so
+    whoever edits a sealed file can edit its cached digest too and slip past the idle-drift check.
     """
 
-    def __init__(self, path: Path | None):
-        self.path = path
-        self._data: dict[str, list] = {}
-        self._dirty = False
-        if path and path.exists():
-            try:
-                self._data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                self._data = {}
+    def __init__(self, data: dict | None = None, *, answers: bool = True):
+        self._data: dict[str, list] = {} if data is None else data
+        self._answers = answers
+
+    def recording(self) -> "HashCache":
+        """The same memory, but every lookup misses: a full check that still warms the cache for later."""
+        return HashCache(self._data, answers=False)
 
     def lookup(self, key: str, st: os.stat_result) -> str | None:
-        hit = self._data.get(key)
+        hit = self._data.get(key) if self._answers else None
         return hit[4] if hit and hit[:4] == [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino] else None
 
     def store(self, key: str, st: os.stat_result, digest: str) -> None:
         self._data[key] = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, digest]
-        self._dirty = True
-
-    def save(self) -> None:
-        if self.path and self._dirty:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(self._data), encoding="utf-8")
-            os.replace(tmp, self.path)
-            self._dirty = False
 
 
 def resolve_baseline(source: str, pinned: str | None = None) -> Path | None:
@@ -249,8 +241,6 @@ def scan(home: Path, include: list[str], exclude: list[str] | None = None,
         target = home / rel
         if os.path.lexists(target):
             add(target)
-    if cache:
-        cache.save()
     return [entries[key] for key in sorted(entries)]
 
 

@@ -61,6 +61,7 @@ class AgentHome:
         self.identity_path = self.sdir / "identity.json"
         self.keystore_path = self.sdir / "agent.keystore.json"
         self._identity: dict | None = None
+        self._hashes = tree.HashCache()
 
     # -- identity --------------------------------------------------------------------------
 
@@ -98,8 +99,9 @@ class AgentHome:
 
     # -- scanning --------------------------------------------------------------------------
 
-    def _cache(self, use_cache: bool) -> tree.HashCache | None:
-        return tree.HashCache(self.sdir / "hashcache.json") if use_cache else None
+    def _cache(self, use_cache: bool) -> tree.HashCache:
+        # A full scan never trusts the cache but still fills it, so the first idle check after start is cheap.
+        return self._hashes if use_cache else self._hashes.recording()
 
     def sealing_config(self) -> dict:
         ident = self.identity
