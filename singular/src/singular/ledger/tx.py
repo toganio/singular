@@ -99,7 +99,7 @@ def check_shape(tx: object) -> dict:
             raise LedgerRejected("BAD_TX", "malformed signature entry")
     try:
         size = len(canonical(tx))
-    except TypeError as exc:
+    except (TypeError, ValueError) as exc:  # ValueError: a lone surrogate cannot be encoded
         raise LedgerRejected("BAD_TX", str(exc)) from None
     if size > MAX_TX_BYTES:
         raise LedgerRejected("BAD_TX", "transaction too large")

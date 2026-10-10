@@ -70,9 +70,11 @@ def test_memory_and_skills_still_live_where_we_seal_them():
     assert {"memories", "skills", "cron"} <= set(_HERMES_HOME_SUBDIRS)
 
 
-def test_bundled_skills_baseline_still_resolves():
-    """Singular seals everything under skills/ that is not byte-identical to what Hermes ships (tree.resolve_baseline)."""
+def test_bundled_skills_baseline_still_resolves(monkeypatch):
+    """Singular seals everything under skills/ that is not byte-identical to what Hermes ships (tree.resolve_baseline).
+    It mirrors _get_bundled_dir() without the HERMES_BUNDLED_SKILLS override (settable from the unsealed .env)."""
     from tools import skills_sync
+    monkeypatch.delenv("HERMES_BUNDLED_SKILLS", raising=False)
     bundled = skills_sync._get_bundled_dir()
     assert bundled.is_dir() and any(bundled.rglob("SKILL.md")), "Hermes no longer ships skills where Singular looks for them"
     assert tree.resolve_baseline("hermes:bundled_skills") == bundled

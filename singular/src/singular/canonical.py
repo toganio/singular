@@ -21,6 +21,8 @@ def _check(value: Any, path: str = "$") -> None:
     if value is None or isinstance(value, (bool, str)):
         return
     if isinstance(value, int):
+        if not -(2**53) <= value <= 2**53:  # beyond this, other languages' JSON numbers silently round
+            raise TypeError(f"integer out of the canonical range ({path})")
         return
     if isinstance(value, float):
         raise TypeError(f"floats are not canonical ({path})")
@@ -38,7 +40,7 @@ def _check(value: Any, path: str = "$") -> None:
 
 
 def canonical(value: Any) -> bytes:
-    """Deterministic UTF-8 JSON: sorted keys, no whitespace, no floats."""
+    """Deterministic UTF-8 JSON: sorted keys, no whitespace, no floats, integers within +-2**53."""
     _check(value)
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 

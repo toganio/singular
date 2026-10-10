@@ -41,6 +41,30 @@ HERMES_SKILLS_BASELINE = {"prefix": "skills", "source": "hermes:bundled_skills"}
 DEFAULT_EXCLUDE = [".bundled_manifest", ".bundled_manifest_*", "__pycache__", "*.pyc", ".DS_Store", "*.tmp", "*.lock", "*.db", "*.db-wal", "*.db-shm", "*-journal",
                    ".usage.json", ".usage_*", ".hub", ".git"]
 
+# Under skills/ a cache is not inert: a planted __pycache__/*.pyc (or .git, or a data file) is code or content a skill
+# runs on. Only Hermes' own bookkeeping, which it rewrites outside any agent action, stays unsealed there.
+_CODE_LIKE = ("__pycache__", "*.pyc", ".git", "*.db", "*.db-wal", "*.db-shm", "*-journal")
+SKILLS_EXCLUDE = [p for p in DEFAULT_EXCLUDE if p not in _CODE_LIKE]
+
+# The sealed path lists live in the unsealed identity.json, yet decide what is sealed. So they are sealed too: a config
+# other than the two `singular init` writes by default adds one synthetic core entry (path under .singular/, which is
+# never scanned, so it cannot collide) whose hash covers the whole config. Default configs add nothing, which keeps
+# every root sealed before this rule valid; switching between them changes the root whenever it would matter.
+CONFIG_PATH = SINGULAR_DIR + "/identity.json"
+
+
+def sealing_config(core: list[str], memory: list[str], exclude: list[str] | None, baselines: list[dict] | None) -> dict:
+    return {"core": list(core), "memory": list(memory), "exclude": list(exclude or []),
+            "baselines": [dict(b) for b in baselines or []]}
+
+
+_DEFAULT_CONFIGS = (sealing_config(DEFAULT_CORE, DEFAULT_MEMORY, [], []),
+                    sealing_config(DEFAULT_CORE, DEFAULT_MEMORY, [], [HERMES_SKILLS_BASELINE]))
+
+
+def config_entries(config: dict) -> list[dict]:
+    return [] if config in _DEFAULT_CONFIGS else [{"p": CONFIG_PATH, "c": hash_obj(config)}]
+
 
 def _excluded(rel: PurePosixPath, patterns: list[str]) -> bool:
     for part in rel.parts:
@@ -53,7 +77,8 @@ def _excluded(rel: PurePosixPath, patterns: list[str]) -> bool:
 
 def check_link(rel: PurePosixPath, target: str) -> None:
     """A sealed symlink must stay inside the agent home. A link to ``/etc/...`` or ``../../x`` would let
-    content that is *not* under the seal steer the agent, and would read the buyer's own files after a sale."""
+    content that is *not* under the seal steer the agent, and would read the buyer's own files after a sale.
+    Lexical only: see :func:`link_target` for the check against the real tree."""
     if os.path.isabs(target) or "\\" in target:
         raise SealError(f"symlink {rel} points outside the agent home ({target}); replace it with a real file")
     depth = len(rel.parts) - 1
@@ -61,6 +86,22 @@ def check_link(rel: PurePosixPath, target: str) -> None:
         depth += -1 if part == ".." else (0 if part == "." else 1)
         if depth < 0:
             raise SealError(f"symlink {rel} points outside the agent home ({target}); replace it with a real file")
+
+
+def link_target(home: Path, rel: PurePosixPath, target: str) -> PurePosixPath:
+    """Where the link ``rel`` -> ``target`` really lands, relative to ``home``. The target is walked one component
+    at a time against the real tree and may not pass through (or end on) another symlink: two links that each look
+    in-home on paper chain into an escape (``x -> ../..``, ``y -> x/../../etc/passwd``)."""
+    check_link(rel, target)
+    here = list(rel.parent.parts)
+    for part in PurePosixPath(target).parts:
+        if part == "..":
+            here.pop()  # check_link: never above home; every directory walked so far is real, so '..' is lexical
+        elif part != ".":
+            here.append(part)
+            if os.path.islink(home.joinpath(*here)):
+                raise SealError(f"symlink {rel} points through another symlink ({target}); replace it with a real file")
+    return PurePosixPath(*here) if here else PurePosixPath(".")
 
 
 def file_sha256(path: Path) -> tuple[str, int]:
@@ -78,49 +119,44 @@ class HashCache:
     Keyed on (size, mtime_ns, ctime_ns, inode). ``ctime`` is the part that matters: ``utime()`` can forge
     mtime after an in-place edit, but nothing short of changing the system clock can set ctime back. It is
     still only a performance hint, so every trust decision (startup, import, transfer) hashes in full.
+
+    Held in memory only, for the life of one process. A cache on disk sits beside the files it vouches for, so
+    whoever edits a sealed file can edit its cached digest too and slip past the idle-drift check.
     """
 
-    def __init__(self, path: Path | None):
-        self.path = path
-        self._data: dict[str, list] = {}
-        self._dirty = False
-        if path and path.exists():
-            try:
-                self._data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                self._data = {}
+    def __init__(self, data: dict | None = None, *, answers: bool = True):
+        self._data: dict[str, list] = {} if data is None else data
+        self._answers = answers
+
+    def recording(self) -> "HashCache":
+        """The same memory, but every lookup misses: a full check that still warms the cache for later."""
+        return HashCache(self._data, answers=False)
 
     def lookup(self, key: str, st: os.stat_result) -> str | None:
-        hit = self._data.get(key)
+        hit = self._data.get(key) if self._answers else None
         return hit[4] if hit and hit[:4] == [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino] else None
 
     def store(self, key: str, st: os.stat_result, digest: str) -> None:
         self._data[key] = [st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, digest]
-        self._dirty = True
-
-    def save(self) -> None:
-        if self.path and self._dirty:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_name(self.path.name + ".tmp")
-            tmp.write_text(json.dumps(self._data), encoding="utf-8")
-            os.replace(tmp, self.path)
-            self._dirty = False
 
 
-def resolve_baseline(source: str) -> Path | None:
+def resolve_baseline(source: str, pinned: str | None = None) -> Path | None:
     """Where the installed software keeps the pristine copy. Unknown or unavailable -> no baseline, which is the
-    safe direction: everything is sealed."""
-    if source == "hermes:bundled_skills":
-        override = os.environ.get("HERMES_BUNDLED_SKILLS")
-        if override:
-            return Path(override) if Path(override).is_dir() else None
-        try:
-            from tools.skills_sync import _get_bundled_dir  # type: ignore  # pinned by tests/test_hermes_contract.py
-            found = Path(_get_bundled_dir())
-            return found if found.is_dir() else None
-        except Exception:  # noqa: BLE001 - Hermes not importable here
-            return None
-    return None
+    safe direction: everything is sealed.
+
+    ``HERMES_BUNDLED_SKILLS`` is NOT read here: Hermes loads it from the unsealed ``.env``, so anyone who can write
+    that file could point the baseline at a look-alike tree holding a planted skill. A packaged install that needs
+    it gets the directory pinned into the (sealed) baseline entry at ``singular init`` instead."""
+    if source != "hermes:bundled_skills":
+        return None
+    if pinned:
+        return Path(pinned) if Path(pinned).is_dir() else None
+    try:
+        from tools import skills_sync  # type: ignore  # pinned by tests/test_hermes_contract.py
+        found = Path(skills_sync.__file__).parent.parent / "skills"  # _get_bundled_dir() minus the env override
+        return found if found.is_dir() else None
+    except Exception:  # noqa: BLE001 - Hermes not importable here
+        return None
 
 
 def scan(home: Path, include: list[str], exclude: list[str] | None = None,
@@ -137,11 +173,16 @@ def scan(home: Path, include: list[str], exclude: list[str] | None = None,
     because the altered file stops matching the baseline and lands under the seal, where it changes the root.
     """
     home = Path(home)
-    patterns = DEFAULT_EXCLUDE + list(exclude or [])
+    patterns, skill_patterns = DEFAULT_EXCLUDE + list(exclude or []), SKILLS_EXCLUDE + list(exclude or [])
+    sealed = [PurePosixPath(item) for item in include]
+
+    def excluded(rel: PurePosixPath) -> bool:
+        return _excluded(rel, skill_patterns if rel.parts[:1] == ("skills",) else patterns)
+
     entries: dict[str, dict] = {}
     shipped: list[tuple[PurePosixPath, Path]] = []
     for baseline in baselines or []:
-        source = resolve_baseline(str(baseline.get("source", "")))
+        source = resolve_baseline(str(baseline.get("source", "")), baseline.get("dir"))
         if source is not None:
             shipped.append((PurePosixPath(str(baseline.get("prefix", ""))), source))
 
@@ -170,12 +211,15 @@ def scan(home: Path, include: list[str], exclude: list[str] | None = None,
 
     def add(path: Path) -> None:
         rel = PurePosixPath(path.relative_to(home).as_posix())
-        if _excluded(rel, patterns):
+        if excluded(rel):
             return
         st = os.lstat(path)
         if stat.S_ISLNK(st.st_mode):
             link = os.readlink(path)
-            check_link(rel, link)
+            dest = link_target(home, rel, link)
+            # A link into an unsealed file (.env, config.yaml, logs/) would let skill content change under an unchanged seal.
+            if excluded(dest) or not any(dest == top or top in dest.parents for top in sealed):
+                raise SealError(f"symlink {rel} points outside the sealed files ({link}); replace it with a real file")
             entries[str(rel)] = {"p": str(rel), "l": link}
         elif stat.S_ISDIR(st.st_mode):
             for child in sorted(os.listdir(path)):
@@ -197,8 +241,6 @@ def scan(home: Path, include: list[str], exclude: list[str] | None = None,
         target = home / rel
         if os.path.lexists(target):
             add(target)
-    if cache:
-        cache.save()
     return [entries[key] for key in sorted(entries)]
 
 
@@ -207,7 +249,7 @@ def root_of(entries: list[dict]) -> str:
 
 
 def summarize(entries: list[dict]) -> dict:
-    return {"root": root_of(entries), "files": len(entries), "bytes": sum(e.get("s", 0) for e in entries)}
+    return {"root": root_of(entries), "files": sum(1 for e in entries if "c" not in e), "bytes": sum(e.get("s", 0) for e in entries)}
 
 
 def diff(old: list[dict], new: list[dict]) -> dict:

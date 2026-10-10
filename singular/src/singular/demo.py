@@ -120,7 +120,7 @@ def main() -> int:
         scenario("capsule leaks neither secrets nor content", b"demo-secret" not in capsule.read_bytes() and b"Acme" not in capsule.read_bytes())
         buyer = SigningKey.generate()
         bought = A.import_capsule(capsule, work / "buyer" / "agent", CAPSULE_PASS, ledger)
-        A.transfer_approve(A.transfer_request(bought, ledger, buyer, BUYER_PASS), ledger, seller)
+        A.transfer_approve(A.transfer_request(bought, ledger, buyer, BUYER_PASS), ledger, seller, ada.agent_id)
         A.transfer_finalize(bought, ledger)
         scenario("ledger names the buyer as owner", ledger.get_agent(ada.agent_id)["owner_pub"] == buyer.public_hex)
         scenario("the seller's leftover copy is dead, right passphrase and all", *refused(LeaseError, SingularGuard(ada, ledger, PASS).start))
