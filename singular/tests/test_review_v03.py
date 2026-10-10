@@ -141,6 +141,55 @@ def test_capsule_refuses_an_oversized_pax_header(tmp_path):
         capsule.unpack(tmp_path / "c.cap", tmp_path / "out", PASSWORD)
 
 
+# -- H3: a re-key never revives a bank grant that a sale voided ---------------------------------------
+
+def _sell(agent, ledger, owner, tmp_path):
+    buyer = SigningKey.generate()
+    A.export_capsule(agent, ledger, tmp_path / "sold.cap", "capsule pass 123")
+    bought = A.import_capsule(tmp_path / "sold.cap", tmp_path / "buyer", "capsule pass 123", ledger)
+    request = A.transfer_request(bought, ledger, buyer, "buyer passphrase 1")
+    A.transfer_approve(request, ledger, owner, agent.agent_id)
+    A.transfer_finalize(bought, ledger)
+    return A.AgentHome(tmp_path / "buyer"), buyer
+
+
+def test_rekey_after_a_sale_does_not_hand_the_bank_to_the_buyer(agent, ledger, owner, tmp_path):
+    from singular.bank import BankMount, BankOwner, DirStore
+    from singular.errors import CryptoError
+    bob = A.init_agent(make_home(tmp_path / "bob"), ledger, "local", owner, PASS, name="Bob", function="x")
+    bank = BankOwner.create(DirStore(tmp_path / "store"), ledger, SigningKey.generate(), "case-law")
+    seed = bank.mount(tmp_path / "owner-mnt")
+    seed.append_entry("CONFIDENTIAL")
+    seed.push()
+    bank.grant(agent.agent_id, "rw")
+    bank.grant(bob.agent_id, "r")
+    bought, _ = _sell(agent, ledger, owner, tmp_path)
+    guard = SingularGuard(bought, ledger, "buyer passphrase 1", heartbeat=False)
+    guard.start()
+    mount = BankMount(bank.store, ledger, bank.bank_id, tmp_path / "bm", agent_id=guard.agent_id, agent_key=guard.agent_key)
+    bank.revoke(bob.agent_id)                                    # an unrelated revoke re-keys the bank
+    with pytest.raises(CryptoError):
+        mount.pull()
+    assert agent.agent_id not in ledger.get_bank(bank.bank_id)["grants"]    # the stale grant was dropped, not re-wrapped
+
+
+def test_ledger_rekey_keeps_a_voided_grant_void(agent, ledger, chain, owner, tmp_path):
+    from singular.bank import BankOwner, DirStore
+    from singular.keys import seal_to
+    from singular.ledger import tx as T
+    bank = BankOwner.create(DirStore(tmp_path / "store"), ledger, SigningKey.generate(), "b")
+    bank.grant(agent.agent_id, "rw")
+    _sell(agent, ledger, owner, tmp_path)
+    record, now = ledger.get_bank(bank.bank_id), chain.head["ts"]
+    agent_rec = ledger.get_agent(agent.agent_id)
+    wrapped = {agent.agent_id: seal_to(agent_rec["enc_pub"], os.urandom(32), context=b"x")}   # an old / hostile client
+    A.submit(ledger, chain.chain_id, T.BANK_REKEY, bank.bank_id, record["nonce"] + 1,
+             {"key_gen": record["key_gen"] + 1, "wrapped_keys": wrapped}, {"owner": bank.key})
+    grant = ledger.get_bank(bank.bank_id)["grants"][agent.agent_id]
+    assert grant["epoch"] == 0 != agent_rec["epoch"]
+    assert not chain.state.grant_valid(ledger.get_bank(bank.bank_id), agent.agent_id, write=False, now_ms=now)
+
+
 # -- H4: the seller signs a transfer only for the agent they mean to sell -----------------------------
 
 def _request_for(ledger, chain, agent_id):

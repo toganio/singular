@@ -448,8 +448,8 @@ class LedgerState:
             _reject("BAD_BODY", "wrapped_keys must cover exactly the current grants (revoke first to drop one)")
         bank["key_gen"] += 1
         for agent_id, key in wrapped.items():
-            agent = self.agents[agent_id]
-            bank["grants"][agent_id].update(wrapped_key=_wrapped(key), key_gen=bank["key_gen"], epoch=agent["epoch"])
+            # The grant keeps the epoch it was made for: a re-key must never revive a grant a sale or rotation voided.
+            bank["grants"][agent_id].update(wrapped_key=_wrapped(key), key_gen=bank["key_gen"])
 
     def _bank_seal(self, bank: dict, tx: dict, now_ms: int) -> None:
         body = tx["body"]
