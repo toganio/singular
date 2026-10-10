@@ -101,9 +101,14 @@ class AgentHome:
     def _cache(self, use_cache: bool) -> tree.HashCache | None:
         return tree.HashCache(self.sdir / "hashcache.json") if use_cache else None
 
+    def sealing_config(self) -> dict:
+        ident = self.identity
+        return tree.sealing_config(ident["core"], ident["memory"], ident.get("exclude"), ident.get("baselines"))
+
     def scan_core(self, use_cache: bool = False) -> list[dict]:
         ident = self.identity
-        return tree.scan(self.home, ident["core"], ident.get("exclude"), self._cache(use_cache), ident.get("baselines"))
+        entries = tree.scan(self.home, ident["core"], ident.get("exclude"), self._cache(use_cache), ident.get("baselines"))
+        return sorted(entries + tree.config_entries(self.sealing_config()), key=lambda e: e["p"])
 
     def scan_memory(self, use_cache: bool = False) -> list[dict]:
         ident = self.identity
@@ -149,6 +154,8 @@ class AgentHome:
         wanted = json.loads(manifest.read_text(encoding="utf-8"))["entries"]
         current = self.scan_core() if kind == "core" else self.scan_memory()
         change = tree.diff(current, wanted)
+        if tree.CONFIG_PATH in change["added"] + change["changed"] + change["removed"]:
+            raise SealError(f"the sealed path lists in {tree.CONFIG_PATH} were edited; put them back as sealed before restoring")
         for rel in change["added"] + change["changed"]:
             entry = next(e for e in wanted if e["p"] == rel)
             dest = self.home / rel
@@ -209,6 +216,13 @@ def init_agent(home: str | Path, ledger: Ledger, ledger_url: str, owner_key: Sig
     if agent_home.is_singular:
         raise SingularError(f"{home} is already a Singular agent ({agent_home.agent_id})")
     agent_home.home.mkdir(parents=True, exist_ok=True)
+    baselines = [dict(b) for b in baselines or []]
+    for baseline in baselines:
+        # A packaged Hermes (Nix, Homebrew) relocates its shipped skills with HERMES_BUNDLED_SKILLS. Pin that directory
+        # into the sealed config now; later the variable is ignored (it can be set from the unsealed .env).
+        override = os.environ.get("HERMES_BUNDLED_SKILLS", "").strip()
+        if baseline.get("source") == "hermes:bundled_skills" and "dir" not in baseline and override:
+            baseline["dir"] = os.path.abspath(override)
     agent_key = SigningKey.generate()
     salt = new_salt()
     agent_id = derive_agent_id(agent_key.public_hex, owner_key.public_hex, salt)
@@ -217,7 +231,7 @@ def init_agent(home: str | Path, ledger: Ledger, ledger_url: str, owner_key: Sig
     policy = {"lease_ttl_ms": lease_ttl_ms, "allow_owner_attest": allow_owner_attest}
     identity = {"v": 1, "agent_id": agent_id, "chain_id": chain_id, "ledger_url": ledger_url,
                 "descriptor": descriptor, "policy": policy, "core": core or list(tree.DEFAULT_CORE),
-                "memory": memory or list(tree.DEFAULT_MEMORY), "exclude": exclude or [], "baselines": baselines or [],
+                "memory": memory or list(tree.DEFAULT_MEMORY), "exclude": exclude or [], "baselines": baselines,
                 "genesis": {"agent_pub": agent_key.public_hex, "owner_pub": owner_key.public_hex, "salt": salt}}
     for rel in identity["memory"]:
         (agent_home.home / rel).mkdir(parents=True, exist_ok=True)
@@ -336,7 +350,7 @@ def export_capsule(agent_home: AgentHome, ledger: Ledger, out_path: Path, capsul
         raise SealError("refusing to export: files do not match the sealed state (run `singular verify`)")
     if report["lease"]:
         raise LeaseError("stop the agent (release its lease) before exporting it")
-    paths = [e["p"] for e in agent_home.scan_core() + agent_home.scan_memory()]
+    paths = [e["p"] for e in agent_home.scan_core() + agent_home.scan_memory() if "c" not in e]
     meta = {"agent_id": agent_home.agent_id, "chain_id": agent_home.identity["chain_id"],
             "core_root": report["core"]["root"], "memory_root": report["memory"]["root"],
             "core_seq": report["core"]["seq"], "memory_seq": report["memory"]["seq"]}

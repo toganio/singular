@@ -41,6 +41,25 @@ HERMES_SKILLS_BASELINE = {"prefix": "skills", "source": "hermes:bundled_skills"}
 DEFAULT_EXCLUDE = [".bundled_manifest", ".bundled_manifest_*", "__pycache__", "*.pyc", ".DS_Store", "*.tmp", "*.lock", "*.db", "*.db-wal", "*.db-shm", "*-journal",
                    ".usage.json", ".usage_*", ".hub", ".git"]
 
+# The sealed path lists live in the unsealed identity.json, yet decide what is sealed. So they are sealed too: a config
+# other than the two `singular init` writes by default adds one synthetic core entry (path under .singular/, which is
+# never scanned, so it cannot collide) whose hash covers the whole config. Default configs add nothing, which keeps
+# every root sealed before this rule valid; switching between them changes the root whenever it would matter.
+CONFIG_PATH = SINGULAR_DIR + "/identity.json"
+
+
+def sealing_config(core: list[str], memory: list[str], exclude: list[str] | None, baselines: list[dict] | None) -> dict:
+    return {"core": list(core), "memory": list(memory), "exclude": list(exclude or []),
+            "baselines": [dict(b) for b in baselines or []]}
+
+
+_DEFAULT_CONFIGS = (sealing_config(DEFAULT_CORE, DEFAULT_MEMORY, [], []),
+                    sealing_config(DEFAULT_CORE, DEFAULT_MEMORY, [], [HERMES_SKILLS_BASELINE]))
+
+
+def config_entries(config: dict) -> list[dict]:
+    return [] if config in _DEFAULT_CONFIGS else [{"p": CONFIG_PATH, "c": hash_obj(config)}]
+
 
 def _excluded(rel: PurePosixPath, patterns: list[str]) -> bool:
     for part in rel.parts:
@@ -107,20 +126,23 @@ class HashCache:
             self._dirty = False
 
 
-def resolve_baseline(source: str) -> Path | None:
+def resolve_baseline(source: str, pinned: str | None = None) -> Path | None:
     """Where the installed software keeps the pristine copy. Unknown or unavailable -> no baseline, which is the
-    safe direction: everything is sealed."""
-    if source == "hermes:bundled_skills":
-        override = os.environ.get("HERMES_BUNDLED_SKILLS")
-        if override:
-            return Path(override) if Path(override).is_dir() else None
-        try:
-            from tools.skills_sync import _get_bundled_dir  # type: ignore  # pinned by tests/test_hermes_contract.py
-            found = Path(_get_bundled_dir())
-            return found if found.is_dir() else None
-        except Exception:  # noqa: BLE001 - Hermes not importable here
-            return None
-    return None
+    safe direction: everything is sealed.
+
+    ``HERMES_BUNDLED_SKILLS`` is NOT read here: Hermes loads it from the unsealed ``.env``, so anyone who can write
+    that file could point the baseline at a look-alike tree holding a planted skill. A packaged install that needs
+    it gets the directory pinned into the (sealed) baseline entry at ``singular init`` instead."""
+    if source != "hermes:bundled_skills":
+        return None
+    if pinned:
+        return Path(pinned) if Path(pinned).is_dir() else None
+    try:
+        from tools import skills_sync  # type: ignore  # pinned by tests/test_hermes_contract.py
+        found = Path(skills_sync.__file__).parent.parent / "skills"  # _get_bundled_dir() minus the env override
+        return found if found.is_dir() else None
+    except Exception:  # noqa: BLE001 - Hermes not importable here
+        return None
 
 
 def scan(home: Path, include: list[str], exclude: list[str] | None = None,
@@ -141,7 +163,7 @@ def scan(home: Path, include: list[str], exclude: list[str] | None = None,
     entries: dict[str, dict] = {}
     shipped: list[tuple[PurePosixPath, Path]] = []
     for baseline in baselines or []:
-        source = resolve_baseline(str(baseline.get("source", "")))
+        source = resolve_baseline(str(baseline.get("source", "")), baseline.get("dir"))
         if source is not None:
             shipped.append((PurePosixPath(str(baseline.get("prefix", ""))), source))
 
@@ -207,7 +229,7 @@ def root_of(entries: list[dict]) -> str:
 
 
 def summarize(entries: list[dict]) -> dict:
-    return {"root": root_of(entries), "files": len(entries), "bytes": sum(e.get("s", 0) for e in entries)}
+    return {"root": root_of(entries), "files": sum(1 for e in entries if "c" not in e), "bytes": sum(e.get("s", 0) for e in entries)}
 
 
 def diff(old: list[dict], new: list[dict]) -> dict:
