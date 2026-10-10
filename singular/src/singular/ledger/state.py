@@ -306,11 +306,14 @@ class LedgerState:
 
     def _rollback(self, agent: dict, tx: dict, now_ms: int) -> None:
         body = tx["body"]
-        T.require_fields(body, ["seq", "prev_root", "root"])
+        sized = "files" in body or "bytes" in body  # files/bytes of the target state; chains from before v0.3 lack them
+        T.require_fields(body, ["seq", "prev_root", "root"] + (["files", "bytes"] if sized else []))
         self._require_owner_idle(agent, tx, now_ms)
         if _hash(body["root"], "root") not in agent["roots"]:
             _reject("UNKNOWN_ROOT", "can only roll back to a state this agent has sealed before")
-        self._next_seal(agent, body, now_ms, "rollback", agent["seal"]["files"], agent["seal"]["bytes"])
+        files, size = (_uint(body["files"], "files"), _uint(body["bytes"], "bytes")) if sized else \
+            (agent["seal"]["files"], agent["seal"]["bytes"])
+        self._next_seal(agent, body, now_ms, "rollback", files, size)
 
     def _owner_attest(self, agent: dict, tx: dict, now_ms: int) -> None:
         body = tx["body"]

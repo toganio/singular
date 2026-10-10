@@ -426,3 +426,56 @@ def test_history_returns_the_newest_entries_and_a_truncated_flag(agent, ledger, 
     assert page["truncated"] is True and [h["txid"] for h in page["history"]] == [h["txid"] for h in full[-3:]]
     assert [h["height"] for h in page["history"]] == sorted(h["height"] for h in page["history"])
     assert json.loads(_call(node, "GET", f"/history/{agent.agent_id}")[1])["truncated"] is False
+
+
+# -- LOW ----------------------------------------------------------------------------------------------
+
+def test_owner_new_does_not_tighten_a_directory_it_did_not_create(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o755)
+    os.chmod(shared, 0o755)
+    A.create_owner_key(shared / "owner.json", PASS)
+    assert shared.stat().st_mode & 0o777 == 0o755
+    A.create_owner_key(tmp_path / "fresh" / "owner.json", PASS)
+    assert (tmp_path / "fresh").stat().st_mode & 0o777 == 0o700
+
+
+def test_import_takes_the_importers_ledger_url_and_refuses_a_capsule_with_stale_history(agent, ledger, tmp_path):
+    from singular.ledger.client import LocalLedger
+    remote = LocalLedger(ledger.chain)
+    remote.url = "https://ledger.buyer.example"
+    A.export_capsule(agent, ledger, tmp_path / "a.cap", "capsule pass 123")
+    bought = A.import_capsule(tmp_path / "a.cap", tmp_path / "b1", "capsule pass 123", remote)
+    assert bought.identity["ledger_url"] == "https://ledger.buyer.example" and A.verify(bought, ledger)["ok"]
+    guard = SingularGuard(agent, ledger, PASS, heartbeat=False)    # the seller runs it once more after packing
+    guard.start()
+    guard.record_action("tool", "t", {}, {})
+    guard.stop()
+    with pytest.raises(SealError, match="action history"):
+        A.import_capsule(tmp_path / "a.cap", tmp_path / "b2", "capsule pass 123", ledger)
+
+
+def test_rollback_records_the_target_size_and_touches_no_file_when_the_ledger_refuses(agent, ledger, owner):
+    from conftest import agent_writes
+    from singular.errors import LedgerRejected
+    first = ledger.get_agent(agent.agent_id)["seal"]
+    guard = SingularGuard(agent, ledger, PASS, heartbeat=False)
+    guard.start()
+    agent_writes(guard, "skills/review/EXTRA.md", "a much longer extra skill file " * 20, tool="skill_manage")
+    guard.stop()
+    before = agent.scan_core()
+    with pytest.raises(LedgerRejected):
+        A.rollback(agent, ledger, SigningKey.generate(), first["root"])         # not the owner: refused...
+    assert agent.scan_core() == before                                            # ...and the files were left alone
+    A.rollback(agent, ledger, owner, first["root"])
+    seal = ledger.get_agent(agent.agent_id)["seal"]
+    assert (seal["root"], seal["files"], seal["bytes"]) == (first["root"], first["files"], first["bytes"])
+    assert A.verify(agent, ledger)["ok"]
+
+
+def test_canonical_refuses_integers_other_languages_would_round():
+    from singular.canonical import canonical
+    assert canonical(2**53) == b"9007199254740992"
+    for bad in (2**53 + 1, -(2**53) - 1, {"x": [10**20]}):
+        with pytest.raises(TypeError):
+            canonical(bad)

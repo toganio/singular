@@ -41,9 +41,11 @@ def create_owner_key(path: Path, passphrase: str) -> SigningKey:
     path = Path(path)
     if path.exists():
         raise SingularError(f"{path} already exists; refusing to overwrite an owner key")
+    created = not path.parent.exists()
     key = SigningKey.generate()
     save_keystore(path, wrap_key(key, passphrase, label="owner"))
-    os.chmod(path.parent, 0o700)
+    if created:  # never tighten a directory the user already had (``--out ./owner.json`` in a shared folder)
+        os.chmod(path.parent, 0o700)
     return key
 
 
@@ -300,12 +302,19 @@ def rotate_agent_key(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKe
 
 
 def rollback(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, root: str) -> dict:
-    """Owner decision: make an *earlier sealed* core state the current one. Recorded on the ledger."""
+    """Owner decision: make an *earlier sealed* core state the current one. Recorded on the ledger first, so the
+    files never sit in a state the ledger refused; the snapshot is checked complete before anything is sent."""
     record = require_agent(ledger, agent_home.agent_id)
+    manifest = agent_home.sdir / "seals" / f"core-{root}.json"
+    entries = json.loads(manifest.read_text(encoding="utf-8"))["entries"] if manifest.exists() else None
+    if entries is None or not all((agent_home.sdir / "objects" / e["h"]).exists() for e in entries if "h" in e):
+        raise SealError(f"no complete local snapshot of core state {root[:12]}; import a capsule of it instead")
+    seal, target = record["seal"], tree.summarize(entries)
+    receipt = submit(ledger, agent_home.identity["chain_id"], T.ROLLBACK, record["id"], record["nonce"] + 1,
+                     {"seq": seal["seq"] + 1, "prev_root": seal["root"], "root": root, "files": target["files"],
+                      "bytes": target["bytes"]}, {"owner": owner_key})
     agent_home.restore("core", root)
-    seal = record["seal"]
-    return submit(ledger, agent_home.identity["chain_id"], T.ROLLBACK, record["id"], record["nonce"] + 1,
-                  {"seq": seal["seq"] + 1, "prev_root": seal["root"], "root": root}, {"owner": owner_key})
+    return receipt
 
 
 def owner_attest(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, reason: str) -> dict:
@@ -377,6 +386,12 @@ def import_capsule(capsule_path: Path, target: Path, capsule_passphrase: str, le
         report = verify(agent_home, ledger)
         if not (report["core"]["ok"] and report["memory"]["ok"]):
             raise SealError("capsule contents do not match the ledger's sealed state; it is stale or was altered")
+        log = ActionLog(agent_home.sdir)
+        if (log.count, log.head) != (report["actions"]["count"], report["actions"]["head"]):
+            raise SealError("the capsule's action history does not end where the ledger's does; it is stale (the agent ran after it was packed)")
+        url = getattr(ledger, "url", None)  # the seller's ledger url is a fact about the seller's machine
+        if url and agent_home.identity.get("ledger_url") != url:
+            agent_home.save_identity({**agent_home.identity, "ledger_url": url})
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
         raise
