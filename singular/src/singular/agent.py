@@ -41,9 +41,11 @@ def create_owner_key(path: Path, passphrase: str) -> SigningKey:
     path = Path(path)
     if path.exists():
         raise SingularError(f"{path} already exists; refusing to overwrite an owner key")
+    created = not path.parent.exists()
     key = SigningKey.generate()
     save_keystore(path, wrap_key(key, passphrase, label="owner"))
-    os.chmod(path.parent, 0o700)
+    if created:  # never tighten a directory the user already had (``--out ./owner.json`` in a shared folder)
+        os.chmod(path.parent, 0o700)
     return key
 
 
@@ -61,6 +63,7 @@ class AgentHome:
         self.identity_path = self.sdir / "identity.json"
         self.keystore_path = self.sdir / "agent.keystore.json"
         self._identity: dict | None = None
+        self._hashes = tree.HashCache()
 
     # -- identity --------------------------------------------------------------------------
 
@@ -98,12 +101,18 @@ class AgentHome:
 
     # -- scanning --------------------------------------------------------------------------
 
-    def _cache(self, use_cache: bool) -> tree.HashCache | None:
-        return tree.HashCache(self.sdir / "hashcache.json") if use_cache else None
+    def _cache(self, use_cache: bool) -> tree.HashCache:
+        # A full scan never trusts the cache but still fills it, so the first idle check after start is cheap.
+        return self._hashes if use_cache else self._hashes.recording()
+
+    def sealing_config(self) -> dict:
+        ident = self.identity
+        return tree.sealing_config(ident["core"], ident["memory"], ident.get("exclude"), ident.get("baselines"))
 
     def scan_core(self, use_cache: bool = False) -> list[dict]:
         ident = self.identity
-        return tree.scan(self.home, ident["core"], ident.get("exclude"), self._cache(use_cache), ident.get("baselines"))
+        entries = tree.scan(self.home, ident["core"], ident.get("exclude"), self._cache(use_cache), ident.get("baselines"))
+        return sorted(entries + tree.config_entries(self.sealing_config()), key=lambda e: e["p"])
 
     def scan_memory(self, use_cache: bool = False) -> list[dict]:
         ident = self.identity
@@ -149,6 +158,8 @@ class AgentHome:
         wanted = json.loads(manifest.read_text(encoding="utf-8"))["entries"]
         current = self.scan_core() if kind == "core" else self.scan_memory()
         change = tree.diff(current, wanted)
+        if tree.CONFIG_PATH in change["added"] + change["changed"] + change["removed"]:
+            raise SealError(f"the sealed path lists in {tree.CONFIG_PATH} were edited; put them back as sealed before restoring")
         for rel in change["added"] + change["changed"]:
             entry = next(e for e in wanted if e["p"] == rel)
             dest = self.home / rel
@@ -209,6 +220,13 @@ def init_agent(home: str | Path, ledger: Ledger, ledger_url: str, owner_key: Sig
     if agent_home.is_singular:
         raise SingularError(f"{home} is already a Singular agent ({agent_home.agent_id})")
     agent_home.home.mkdir(parents=True, exist_ok=True)
+    baselines = [dict(b) for b in baselines or []]
+    for baseline in baselines:
+        # A packaged Hermes (Nix, Homebrew) relocates its shipped skills with HERMES_BUNDLED_SKILLS. Pin that directory
+        # into the sealed config now; later the variable is ignored (it can be set from the unsealed .env).
+        override = os.environ.get("HERMES_BUNDLED_SKILLS", "").strip()
+        if baseline.get("source") == "hermes:bundled_skills" and "dir" not in baseline and override:
+            baseline["dir"] = os.path.abspath(override)
     agent_key = SigningKey.generate()
     salt = new_salt()
     agent_id = derive_agent_id(agent_key.public_hex, owner_key.public_hex, salt)
@@ -217,7 +235,7 @@ def init_agent(home: str | Path, ledger: Ledger, ledger_url: str, owner_key: Sig
     policy = {"lease_ttl_ms": lease_ttl_ms, "allow_owner_attest": allow_owner_attest}
     identity = {"v": 1, "agent_id": agent_id, "chain_id": chain_id, "ledger_url": ledger_url,
                 "descriptor": descriptor, "policy": policy, "core": core or list(tree.DEFAULT_CORE),
-                "memory": memory or list(tree.DEFAULT_MEMORY), "exclude": exclude or [], "baselines": baselines or [],
+                "memory": memory or list(tree.DEFAULT_MEMORY), "exclude": exclude or [], "baselines": baselines,
                 "genesis": {"agent_pub": agent_key.public_hex, "owner_pub": owner_key.public_hex, "salt": salt}}
     for rel in identity["memory"]:
         (agent_home.home / rel).mkdir(parents=True, exist_ok=True)
@@ -284,12 +302,19 @@ def rotate_agent_key(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKe
 
 
 def rollback(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, root: str) -> dict:
-    """Owner decision: make an *earlier sealed* core state the current one. Recorded on the ledger."""
+    """Owner decision: make an *earlier sealed* core state the current one. Recorded on the ledger first, so the
+    files never sit in a state the ledger refused; the snapshot is checked complete before anything is sent."""
     record = require_agent(ledger, agent_home.agent_id)
+    manifest = agent_home.sdir / "seals" / f"core-{root}.json"
+    entries = json.loads(manifest.read_text(encoding="utf-8"))["entries"] if manifest.exists() else None
+    if entries is None or not all((agent_home.sdir / "objects" / e["h"]).exists() for e in entries if "h" in e):
+        raise SealError(f"no complete local snapshot of core state {root[:12]}; import a capsule of it instead")
+    seal, target = record["seal"], tree.summarize(entries)
+    receipt = submit(ledger, agent_home.identity["chain_id"], T.ROLLBACK, record["id"], record["nonce"] + 1,
+                     {"seq": seal["seq"] + 1, "prev_root": seal["root"], "root": root, "files": target["files"],
+                      "bytes": target["bytes"]}, {"owner": owner_key})
     agent_home.restore("core", root)
-    seal = record["seal"]
-    return submit(ledger, agent_home.identity["chain_id"], T.ROLLBACK, record["id"], record["nonce"] + 1,
-                  {"seq": seal["seq"] + 1, "prev_root": seal["root"], "root": root}, {"owner": owner_key})
+    return receipt
 
 
 def owner_attest(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, reason: str) -> dict:
@@ -336,7 +361,7 @@ def export_capsule(agent_home: AgentHome, ledger: Ledger, out_path: Path, capsul
         raise SealError("refusing to export: files do not match the sealed state (run `singular verify`)")
     if report["lease"]:
         raise LeaseError("stop the agent (release its lease) before exporting it")
-    paths = [e["p"] for e in agent_home.scan_core() + agent_home.scan_memory()]
+    paths = [e["p"] for e in agent_home.scan_core() + agent_home.scan_memory() if "c" not in e]
     meta = {"agent_id": agent_home.agent_id, "chain_id": agent_home.identity["chain_id"],
             "core_root": report["core"]["root"], "memory_root": report["memory"]["root"],
             "core_seq": report["core"]["seq"], "memory_seq": report["memory"]["seq"]}
@@ -361,6 +386,12 @@ def import_capsule(capsule_path: Path, target: Path, capsule_passphrase: str, le
         report = verify(agent_home, ledger)
         if not (report["core"]["ok"] and report["memory"]["ok"]):
             raise SealError("capsule contents do not match the ledger's sealed state; it is stale or was altered")
+        log = ActionLog(agent_home.sdir)
+        if (log.count, log.head) != (report["actions"]["count"], report["actions"]["head"]):
+            raise SealError("the capsule's action history does not end where the ledger's does; it is stale (the agent ran after it was packed)")
+        url = getattr(ledger, "url", None)  # the seller's ledger url is a fact about the seller's machine
+        if url and agent_home.identity.get("ledger_url") != url:
+            agent_home.save_identity({**agent_home.identity, "ledger_url": url})
     except BaseException:
         shutil.rmtree(target, ignore_errors=True)
         raise
@@ -387,14 +418,21 @@ def transfer_request(agent_home: AgentHome, ledger: Ledger, new_owner_key: Signi
     return {"kind": "singular-transfer-request", "chain_id": chain_id, "tx": transaction}
 
 
-def transfer_approve(request: dict, ledger: Ledger, owner_key: SigningKey) -> dict:
-    """Seller side: the last signature. After this lands, the seller's copy can never run again."""
+def transfer_approve(request: dict, ledger: Ledger, owner_key: SigningKey, agent_id: str) -> dict:
+    """Seller side: the last signature. After this lands, the seller's copy can never run again.
+
+    ``agent_id`` is the agent the seller means to sell. The request is a file from the buyer, built from public
+    ledger data alone; without this check it could name any other agent the same owner key controls."""
     if request.get("kind") != "singular-transfer-request":
         raise SingularError("not a transfer request")
     check_chain(ledger, request["chain_id"])
     transaction = T.check_shape(request["tx"])
     if transaction["type"] != T.TRANSFER:
         raise SingularError("transfer request carries the wrong transaction type")
+    if transaction["subject"] != agent_id:
+        raise SingularError(f"this request is for agent {transaction['subject']}, not {agent_id}; refusing to sign it")
+    if require_agent(ledger, agent_id)["owner_pub"] != owner_key.public_hex:
+        raise SingularError(f"this owner key does not own agent {agent_id}")
     T.sign(transaction, request["chain_id"], "owner", owner_key)
     return ledger.submit(transaction)
 

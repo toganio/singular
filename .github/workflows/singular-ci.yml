@@ -39,7 +39,8 @@ jobs:
       - name: End-to-end demo against a real HTTP ledger node
         run: .venv-ci/bin/python -m singular.demo
       - name: Singular touches no Hermes file
-        if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'upstream-sync/')
+        # Only our own sync branches may touch Hermes files; a fork PR named upstream-sync/* is checked like any other.
+        if: github.event_name == 'pull_request' && !(startsWith(github.head_ref, 'upstream-sync/') && github.event.pull_request.head.repo.full_name == github.repository)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

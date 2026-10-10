@@ -4,6 +4,8 @@ name: singular-upstream-sync
 # If so: merge it on a branch, bump HERMES_BASE, open a PR. singular-ci then proves (or disproves) that
 # Singular still works on the new Hermes. Green -> merges itself (merge commit, never squash: squashing
 # would cut the ancestry and make the *next* sync conflict). Red -> the PR stays open and an issue says so.
+# A release that adds or changes anything under .github/workflows/ is never auto-merged: SYNC_TOKEN can push
+# workflows, and merging upstream-authored CI unreviewed would hand it this repo's secrets. A human merges those.
 #
 # Needs a repo secret SYNC_TOKEN (classic PAT with `repo` + `workflow`, or a fine-grained token with
 # contents/pull-requests/workflows write): the default GITHUB_TOKEN may not push commits that touch
@@ -81,6 +83,9 @@ jobs:
             git merge --abort
             exit 0
           fi
+          # What the merge brings in under .github/workflows/ (upstream never legitimately touches singular-*, so all count).
+          git diff --name-only HEAD^1 HEAD -- .github/workflows/ > /tmp/workflows.txt
+          if [ -s /tmp/workflows.txt ]; then echo "review=true" >> "$GITHUB_OUTPUT"; else echo "review=false" >> "$GITHUB_OUTPUT"; fi
           echo "$TAG" > singular/HERMES_BASE
           git commit -am "sync: HERMES_BASE -> $TAG"
           git push --force-with-lease origin "upstream-sync/$TAG"
@@ -90,6 +95,7 @@ jobs:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
           TAG: ${{ steps.target.outputs.tag }}
           BASE: ${{ steps.target.outputs.base }}
+          REVIEW: ${{ steps.merge.outputs.review }}
         run: |
           url=$(gh pr create -R "$GH_REPO" --base main --head "upstream-sync/$TAG" --title "sync: Hermes Agent $TAG" \
             --body "Automated sync from \`$BASE\` to \`$TAG\` (https://github.com/$UPSTREAM/releases/tag/$TAG).
@@ -99,7 +105,14 @@ jobs:
           adapt \`singular/src/singular/hermes_plugin.py\` on this branch.
 
           **Merge with a merge commit, never squash.**")
-          gh pr merge "$url" -R "$GH_REPO" --auto --merge
+          if [ "$REVIEW" = "true" ]; then
+            gh pr comment "$url" -R "$GH_REPO" --body "Not auto-merged: this release adds or changes workflow files. Review them, then merge (merge commit) by hand:
+          \`\`\`
+          $(cat /tmp/workflows.txt)
+          \`\`\`"
+          else
+            gh pr merge "$url" -R "$GH_REPO" --auto --merge
+          fi
       - name: Report a merge conflict
         if: steps.target.outputs.needed == 'true' && steps.merge.outputs.conflict == 'true'
         env:

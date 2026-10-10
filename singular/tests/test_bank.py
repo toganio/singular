@@ -141,7 +141,7 @@ def test_selling_an_agent_drops_its_bank_access(bank, ledger, owner, tmp_path):
     bank.grant(ada.agent_id, "rw")
     A.export_capsule(ada, ledger, tmp_path / "a.capsule", "capsule passphrase 1")
     bought = A.import_capsule(tmp_path / "a.capsule", tmp_path / "buyer", "capsule passphrase 1", ledger)
-    A.transfer_approve(A.transfer_request(bought, ledger, SigningKey.generate(), "buyer passphrase 9"), ledger, owner)
+    A.transfer_approve(A.transfer_request(bought, ledger, SigningKey.generate(), "buyer passphrase 9"), ledger, owner, ada.agent_id)
     A.transfer_finalize(bought, ledger)
     guard = SingularGuard(bought, ledger, "buyer passphrase 9", heartbeat=False)
     guard.start()

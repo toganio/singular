@@ -43,16 +43,16 @@ def test_sealed_box_is_bound_to_recipient_and_context():
 def test_scan_never_follows_symlinks_or_seals_secrets(tmp_path):
     (tmp_path / "skills").mkdir()
     (tmp_path / "SOUL.md").write_text("soul")
-    os.symlink("../SOUL.md", tmp_path / "skills" / "link")   # in-home link: recorded, never followed
+    os.symlink("../SOUL.md", tmp_path / "skills" / "link")   # link to another sealed file: recorded, never followed
     (tmp_path / "skills" / ".env").write_text("KEY=1")
     (tmp_path / "skills" / "a.md").write_text("a")
-    entries = tree.scan(tmp_path, ["skills"])
-    assert [e["p"] for e in entries] == ["skills/a.md", "skills/link"] and "l" in entries[1]
+    entries = tree.scan(tmp_path, ["SOUL.md", "skills"])
+    assert [e["p"] for e in entries] == ["SOUL.md", "skills/a.md", "skills/link"] and "l" in entries[2]
     with pytest.raises(SealError):
         tree.scan(tmp_path, ["../etc"])
     root = tree.root_of(entries)
     (tmp_path / "skills" / "a.md").write_text("b")
-    assert tree.root_of(tree.scan(tmp_path, ["skills"])) != root
+    assert tree.root_of(tree.scan(tmp_path, ["SOUL.md", "skills"])) != root
 
 
 def _evil_capsule(path, members):
@@ -131,7 +131,7 @@ def test_symlink_out_of_home_cannot_be_sealed_or_imported(tmp_path):
         tree.scan(tmp_path, ["skills"])
     (tmp_path / "skills" / "rel").unlink()
     os.symlink("../SOUL.md", tmp_path / "skills" / "ok")
-    assert tree.scan(tmp_path, ["skills"])[0]["l"] == "../SOUL.md"
+    assert tree.scan(tmp_path, ["SOUL.md", "skills"])[0]["l"] == "../SOUL.md"
     evil = tmp_path / "evil.capsule"
     _evil_capsule(evil, [_link("skills/leak", "/etc/passwd")])
     with pytest.raises(CapsuleError):

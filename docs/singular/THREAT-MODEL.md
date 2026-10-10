@@ -53,6 +53,10 @@ What remains true after all that:
 * The ledger pin defends against the ledger, not against someone with write access to the agent's own disk, who can delete it.
 * Hermes' optional "staged memory writes" (`/memory approve`) apply changes outside any tool call. Under Singular that is an
   outside edit by design: keep that Hermes option off for Singular agents.
+* `singular run -- <command>` records tool calls only when the command is Hermes running **in-process** (Hermes importable in
+  Singular's Python). Any other command merely holds the lease; what it writes to sealed files is an outside edit by design.
+* `identity.json` stays unsealed apart from the path lists: its `ledger_url` is operator configuration. Pointing it at a hostile
+  node is defeated by the chain id every signature binds and by the pinned head, not by the seal; use https.
 * The trust boundary is the installed software. Someone who can replace Hermes or Singular on the machine owns that run; the
   ledger still prevents them from running a second instance or rewriting what was already recorded.
 
@@ -63,23 +67,27 @@ What remains true after all that:
 | Thief with a copy of the agent folder | run the agent / read it | agent key is scrypt+ChaCha20-Poly1305 wrapped; capsules are encrypted; no key → no lease |
 | Owner (or ex-employee) with the passphrase, running a second copy | two instances | `LEASE_ACQUIRE` fails while a lease is live; lease is bound to a per-process host key, so holding the agent key is not enough to seal, anchor, renew or release |
 | Same, using an old backup after the agent moved on | roll the agent back quietly | acquiring the lease requires the *current* sealed core and memory roots; stale copy → `STALE_STATE` |
-| Anyone with disk access while the agent is stopped | plant a skill / memory | full re-hash at every start; mismatch → refuses to start, every tool blocked |
-| Anyone with disk access while the agent is **running** | slip a change in and let the agent seal it as its own | idle-drift check before every action (ctime-keyed cache: a forged mtime does not hide an in-place edit); drift → no actions, no seals |
+| Anyone with disk access while the agent is stopped | plant a skill / memory | full re-hash at every start; mismatch → refuses to start, every tool blocked. The sealed path lists in `identity.json` are bound into the core root (editing them to hide a file fails verification); the skills baseline ignores `HERMES_BUNDLED_SKILLS` from `.env`; symlinks must land on sealed files without passing through another link |
+| Anyone with disk access while the agent is **running** | slip a change in and let the agent seal it as its own | idle-drift check before every action (in-memory, ctime-keyed cache: neither a forged mtime nor an edited cache file hides an in-place edit); drift → no actions, no seals |
 | Thief who has the files **and** the passphrase | impersonate the agent | owner rotates the key (`ROTATE_KEY`); the thief's running instance loses the lease in the same block |
 | Ledger operator / host | rewrite or truncate history | pinned head continuity check at start, on every renewal and at shutdown |
 | Seller after a sale | keep using the agent | `TRANSFER` replaces the agent key; old key and old owner key are rejected from that block on |
+| Buyer of one agent | get the seller to sign away another | `transfer approve` signs only a request for the agent id the seller names (`--agent` / `--home`) |
+| Buyer, via a bank the sold agent was in | read the bank after the sale | the epoch bump voids the grant, and a later re-key keeps it void (clients revoke such grants instead of re-wrapping) |
 | Buyer before paying / before transfer | act as the agent under the seller's name | sale capsules carry **no agent key** and no private action records |
 | Malicious capsule | write outside the target, plant secrets, smuggle links | hand-rolled extraction: regular files + in-home symlinks only, no traversal, no writes through links, no secret filenames, size/member caps; then a full verify against the ledger |
-| Malicious *member* of a shared bank | overwrite others' files, write outside their mounts, erase entries | manifests are treated as hostile input (path/shape validation); store content is checked against the ledger root; writes are merged against a single bank snapshot so a race ends in a retry, never a silent drop |
+| Malicious *member* of a shared bank | write outside their mounts on other members' machines; race honest writers | manifests are treated as hostile input (path/shape validation); store content is checked against the ledger root; writes are merged against a single bank snapshot so a race ends in a retry, never a silent drop |
+| Malicious `rw` member of a shared bank | overwrite or erase other members' entries | **not prevented, only made visible.** The ledger holds one root per bank and cannot see paths, so a hostile client can seal a state without others' entries. Honest clients refuse to touch anything outside `entries/<their agent id>/`; the erased entries survive in the earlier manifest and blobs (the store never deletes), and the ledger names the writer of every seal (`seal.by`). Grant `rw` only to agents you would trust with the bank's contents; revoke is immediate |
 | Whoever hosts a bank's storage | read or alter memory | storage holds only ciphertext; readers verify manifest and blobs against the ledger root |
 | Network attacker | lie about leases/seals | client refuses plain-http ledgers off-machine; signatures bind the chain id (no cross-chain replay); per-subject nonces (no replay) |
-| Spammer against a public node | bloat the chain | per-address token buckets for writes and reads, body caps, optional operator token for `REGISTER`/`BANK_CREATE`; run a real proxy in front as well |
+| Spammer against a public node | bloat the chain, exhaust the node | per-address token buckets for writes and reads (address churn cannot reset a throttled client), body caps, a cap on concurrent connections, a 20 s deadline per request (slowloris), optional operator token for `REGISTER`/`BANK_CREATE`. A public node **must** sit behind a TLS-terminating proxy, which is also where real per-client limits belong |
 | Clock skew | act on a dead lease | runtime stops acting at 90% of the lease lifetime as stamped by the validator |
 
 ## Fail-closed behaviour
 
 If the ledger is unreachable the heartbeat keeps trying, but `check()` starts refusing actions once the
-lease deadline (minus the skew margin) passes. If the ledger reports that the agent's history moved on
+lease deadline (minus the skew margin) passes. A lost answer (the transaction landed, the reply did not) is not fatal: the guard
+re-reads its record before the next submission and adopts what landed; a seal that did not land is retried before the next action. If the ledger reports that the agent's history moved on
 without this process (`NONCE_CONFLICT` with someone else's lease, `NO_LEASE`, `LEASE_EXPIRED`), the guard
 marks itself lost and never recovers within that process.
 
