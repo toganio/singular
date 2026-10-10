@@ -169,6 +169,9 @@ def _stop_before_hard_exit(guard: SingularGuard, after=None):
         except Exception as exc:  # noqa: BLE001 - never block the exit itself
             print(f"singular: release before exit failed: {exc}", file=sys.stderr)
         finally:
+            for stream in (sys.stdout, sys.stderr):  # os._exit does not flush; keep what we printed
+                with contextlib.suppress(Exception):
+                    stream.flush()
             real_exit(code)
 
     os._exit = _exit
