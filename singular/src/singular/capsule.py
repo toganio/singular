@@ -32,18 +32,27 @@ from .errors import CapsuleError, CryptoError
 from . import keys as _keys
 from .keys import check_passphrase, derive_key
 from .errors import SealError
-from .tree import SECRET_NAMES, SINGULAR_DIR, check_link
+from .tree import SECRET_NAMES, SINGULAR_DIR, check_link, link_target
 
 MAGIC = b"SNGCAP1\n"
 CHUNK = 1 << 20
 MAX_HEADER = 64 * 1024
-MAX_MEMBERS = 200_000
-MAX_UNPACKED_BYTES = 64 << 30
+MAX_MEMBERS = 100_000
+MAX_UNPACKED_BYTES = 16 << 30
+MAX_META_BYTES = 64 * 1024  # pax / GNU long-name headers are read into memory whole
 # Runtime-only files inside .singular that must not travel.
 _LOCAL_ONLY = {"hashcache.json", "runtime.json", "banks", "objects", "seals", "agent.keystore.pending.json"}
 # Left out of a capsule made for a *sale*: the seller's wrapped key (a buyer could grind its passphrase and run
 # the agent under the seller's name before the transfer lands) and the seller's private action records.
 _SELLER_ONLY = {"agent.keystore.json", "actions.jsonl"}
+
+
+class _CappedTarInfo(tarfile.TarInfo):
+    def _proc_member(self, tarfile_):
+        if self.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE, tarfile.GNUTYPE_LONGNAME,
+                         tarfile.GNUTYPE_LONGLINK) and self.size > MAX_META_BYTES:
+            raise tarfile.HeaderError("oversized extended header")
+        return super()._proc_member(tarfile_)
 
 
 def _aad(header_hash: bytes, index: int, final: bool) -> bytes:
@@ -188,8 +197,9 @@ def unpack(capsule_path: Path, target: Path, passphrase: str) -> dict:
         os.chmod(target, 0o700)
         root = target.resolve()
         count = written = 0
+        links: list[tuple[PurePosixPath, str]] = []
         try:
-            with tarfile.open(fileobj=plain, mode="r:gz") as tar:
+            with tarfile.open(fileobj=plain, mode="r:gz", tarinfo=_CappedTarInfo) as tar:
                 for member in tar:
                     count += 1
                     if count > MAX_MEMBERS:
@@ -208,6 +218,7 @@ def unpack(capsule_path: Path, target: Path, passphrase: str) -> dict:
                         except SealError as exc:
                             raise CapsuleError(str(exc)) from None
                         os.symlink(member.linkname, dest)
+                        links.append((rel, member.linkname))
                         continue
                     source = tar.extractfile(member)
                     fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -221,4 +232,10 @@ def unpack(capsule_path: Path, target: Path, passphrase: str) -> dict:
                         os.chmod(dest, 0o700)
         except (tarfile.TarError, EOFError, OSError) as exc:
             raise CapsuleError(f"capsule payload is corrupt: {exc}") from None
+        # Only with every link in place can a chain of individually in-home links be seen.
+        for rel, linkname in links:
+            try:
+                link_target(root, rel, linkname)
+            except SealError as exc:
+                raise CapsuleError(str(exc)) from None
     return header

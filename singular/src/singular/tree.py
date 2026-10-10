@@ -41,6 +41,11 @@ HERMES_SKILLS_BASELINE = {"prefix": "skills", "source": "hermes:bundled_skills"}
 DEFAULT_EXCLUDE = [".bundled_manifest", ".bundled_manifest_*", "__pycache__", "*.pyc", ".DS_Store", "*.tmp", "*.lock", "*.db", "*.db-wal", "*.db-shm", "*-journal",
                    ".usage.json", ".usage_*", ".hub", ".git"]
 
+# Under skills/ a cache is not inert: a planted __pycache__/*.pyc (or .git, or a data file) is code or content a skill
+# runs on. Only Hermes' own bookkeeping, which it rewrites outside any agent action, stays unsealed there.
+_CODE_LIKE = ("__pycache__", "*.pyc", ".git", "*.db", "*.db-wal", "*.db-shm", "*-journal")
+SKILLS_EXCLUDE = [p for p in DEFAULT_EXCLUDE if p not in _CODE_LIKE]
+
 # The sealed path lists live in the unsealed identity.json, yet decide what is sealed. So they are sealed too: a config
 # other than the two `singular init` writes by default adds one synthetic core entry (path under .singular/, which is
 # never scanned, so it cannot collide) whose hash covers the whole config. Default configs add nothing, which keeps
@@ -72,7 +77,8 @@ def _excluded(rel: PurePosixPath, patterns: list[str]) -> bool:
 
 def check_link(rel: PurePosixPath, target: str) -> None:
     """A sealed symlink must stay inside the agent home. A link to ``/etc/...`` or ``../../x`` would let
-    content that is *not* under the seal steer the agent, and would read the buyer's own files after a sale."""
+    content that is *not* under the seal steer the agent, and would read the buyer's own files after a sale.
+    Lexical only: see :func:`link_target` for the check against the real tree."""
     if os.path.isabs(target) or "\\" in target:
         raise SealError(f"symlink {rel} points outside the agent home ({target}); replace it with a real file")
     depth = len(rel.parts) - 1
@@ -80,6 +86,22 @@ def check_link(rel: PurePosixPath, target: str) -> None:
         depth += -1 if part == ".." else (0 if part == "." else 1)
         if depth < 0:
             raise SealError(f"symlink {rel} points outside the agent home ({target}); replace it with a real file")
+
+
+def link_target(home: Path, rel: PurePosixPath, target: str) -> PurePosixPath:
+    """Where the link ``rel`` -> ``target`` really lands, relative to ``home``. The target is walked one component
+    at a time against the real tree and may not pass through (or end on) another symlink: two links that each look
+    in-home on paper chain into an escape (``x -> ../..``, ``y -> x/../../etc/passwd``)."""
+    check_link(rel, target)
+    here = list(rel.parent.parts)
+    for part in PurePosixPath(target).parts:
+        if part == "..":
+            here.pop()  # check_link: never above home; every directory walked so far is real, so '..' is lexical
+        elif part != ".":
+            here.append(part)
+            if os.path.islink(home.joinpath(*here)):
+                raise SealError(f"symlink {rel} points through another symlink ({target}); replace it with a real file")
+    return PurePosixPath(*here) if here else PurePosixPath(".")
 
 
 def file_sha256(path: Path) -> tuple[str, int]:
@@ -159,7 +181,12 @@ def scan(home: Path, include: list[str], exclude: list[str] | None = None,
     because the altered file stops matching the baseline and lands under the seal, where it changes the root.
     """
     home = Path(home)
-    patterns = DEFAULT_EXCLUDE + list(exclude or [])
+    patterns, skill_patterns = DEFAULT_EXCLUDE + list(exclude or []), SKILLS_EXCLUDE + list(exclude or [])
+    sealed = [PurePosixPath(item) for item in include]
+
+    def excluded(rel: PurePosixPath) -> bool:
+        return _excluded(rel, skill_patterns if rel.parts[:1] == ("skills",) else patterns)
+
     entries: dict[str, dict] = {}
     shipped: list[tuple[PurePosixPath, Path]] = []
     for baseline in baselines or []:
@@ -192,12 +219,15 @@ def scan(home: Path, include: list[str], exclude: list[str] | None = None,
 
     def add(path: Path) -> None:
         rel = PurePosixPath(path.relative_to(home).as_posix())
-        if _excluded(rel, patterns):
+        if excluded(rel):
             return
         st = os.lstat(path)
         if stat.S_ISLNK(st.st_mode):
             link = os.readlink(path)
-            check_link(rel, link)
+            dest = link_target(home, rel, link)
+            # A link into an unsealed file (.env, config.yaml, logs/) would let skill content change under an unchanged seal.
+            if excluded(dest) or not any(dest == top or top in dest.parents for top in sealed):
+                raise SealError(f"symlink {rel} points outside the sealed files ({link}); replace it with a real file")
             entries[str(rel)] = {"p": str(rel), "l": link}
         elif stat.S_ISDIR(st.st_mode):
             for child in sorted(os.listdir(path)):
