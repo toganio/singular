@@ -337,3 +337,92 @@ def test_a_bank_member_cannot_erase_another_members_entries_through_the_client(a
     me = BankMount(bank.store, ledger, bank.bank_id, tmp_path / "me2", agent_id=ge.agent_id, agent_key=ge.agent_key)
     me.append_entry("Eve's note")                                     # her own entries still go through
     assert me.push(ge.signers()) and ma.pull()["updated"] == 1 and len(ma.list()) == 2
+
+
+# -- M6: the ledger node answers hostile input, bounds its threads, and cuts slow requests --------------
+
+@pytest.fixture
+def node(chain):
+    from singular.ledger.node import LedgerNode
+    n = LedgerNode(chain, max_workers=4).start()
+    yield n
+    n.stop()
+
+
+def _call(node, method, path, body=None):
+    import http.client
+    host, port = node._server.server_address[:2]
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    conn.request(method, path, body=body)
+    resp = conn.getresponse()
+    return resp.status, resp.read(), dict(resp.getheaders())
+
+
+@pytest.mark.parametrize("method,path,body", [
+    ("POST", "/tx", b"[" * 30000 + b"]" * 30000),                                         # RecursionError
+    ("POST", "/tx", json.dumps({"v": 1, "type": "SEAL", "subject": "sng1aaaaaaaa", "nonce": 1, "body": {"x": "\ud800"},
+                                "sigs": [{"role": "a", "pub": "", "sig": ""}]}).encode()),    # UnicodeEncodeError
+    ("GET", "/blocks?from=99999999999999999999", None),                                    # OverflowError
+    ("GET", "/history/sng1aaaaaaaa?limit=x", None),
+])
+def test_node_answers_hostile_input_with_an_error_not_a_dropped_connection(node, method, path, body):
+    status, data, _ = _call(node, method, path, body)
+    assert status in (400, 409) and "error" in json.loads(data)
+
+
+def test_node_server_header_does_not_reveal_python(node):
+    _, _, headers = _call(node, "GET", "/info")
+    assert headers["Server"] == "singular-ledger" and "Python" not in json.dumps(headers)
+    assert headers["X-Content-Type-Options"] == "nosniff" and headers["Cache-Control"] == "no-store"
+
+
+def test_rate_limiter_is_not_reset_by_address_churn():
+    from singular.ledger.node import RateLimiter
+    limiter = RateLimiter(per_minute=1, burst=1, max_clients=100)
+    assert limiter.allow("attacker") and not limiter.allow("attacker")
+    for i in range(1000):
+        limiter.allow(f"churn-{i}")
+    assert not limiter.allow("attacker") and len(limiter._buckets) <= 101
+
+
+def test_a_slowloris_request_is_cut_at_the_deadline_and_workers_are_capped(chain, monkeypatch):
+    import socket
+    import time
+    from singular.ledger import node as N
+    monkeypatch.setattr(N, "REQUEST_DEADLINE_S", 1.0)
+    n = N.LedgerNode(chain, max_workers=2).start()
+    try:
+        address = n._server.server_address[:2]
+        slow = [socket.create_connection(address) for _ in range(2)]
+        for s in slow:
+            s.sendall(b"GET /info HTTP/1.1\r\n")                         # ...and never finish the headers
+        time.sleep(0.3)
+        with pytest.raises(OSError):                                    # both workers busy: a third is turned away
+            _call(n, "GET", "/info")
+        started = time.monotonic()
+        for s in slow:
+            s.settimeout(5)
+            while s.recv(1024):                                         # the watchdog cuts each slow request
+                pass
+        assert time.monotonic() - started < 4
+        time.sleep(0.2)
+        assert _call(n, "GET", "/info")[0] == 200                       # and the slots come back
+    finally:
+        n.stop()
+
+
+# -- M7: /history returns the newest transactions and says when it truncated ---------------------------
+
+def test_history_returns_the_newest_entries_and_a_truncated_flag(agent, ledger, chain, node):
+    guard = SingularGuard(agent, ledger, PASS, heartbeat=False)
+    guard.start()
+    for _ in range(4):
+        guard.renew()
+    guard.stop()
+    full = ledger.history(agent.agent_id)
+    assert [h["tx"]["type"] for h in full][-1] == "LEASE_RELEASE" and len(full) == 7
+    status, data, _ = _call(node, "GET", f"/history/{agent.agent_id}?limit=3")
+    page = json.loads(data)
+    assert page["truncated"] is True and [h["txid"] for h in page["history"]] == [h["txid"] for h in full[-3:]]
+    assert [h["height"] for h in page["history"]] == sorted(h["height"] for h in page["history"])
+    assert json.loads(_call(node, "GET", f"/history/{agent.agent_id}")[1])["truncated"] is False
