@@ -401,14 +401,21 @@ def transfer_request(agent_home: AgentHome, ledger: Ledger, new_owner_key: Signi
     return {"kind": "singular-transfer-request", "chain_id": chain_id, "tx": transaction}
 
 
-def transfer_approve(request: dict, ledger: Ledger, owner_key: SigningKey) -> dict:
-    """Seller side: the last signature. After this lands, the seller's copy can never run again."""
+def transfer_approve(request: dict, ledger: Ledger, owner_key: SigningKey, agent_id: str) -> dict:
+    """Seller side: the last signature. After this lands, the seller's copy can never run again.
+
+    ``agent_id`` is the agent the seller means to sell. The request is a file from the buyer, built from public
+    ledger data alone; without this check it could name any other agent the same owner key controls."""
     if request.get("kind") != "singular-transfer-request":
         raise SingularError("not a transfer request")
     check_chain(ledger, request["chain_id"])
     transaction = T.check_shape(request["tx"])
     if transaction["type"] != T.TRANSFER:
         raise SingularError("transfer request carries the wrong transaction type")
+    if transaction["subject"] != agent_id:
+        raise SingularError(f"this request is for agent {transaction['subject']}, not {agent_id}; refusing to sign it")
+    if require_agent(ledger, agent_id)["owner_pub"] != owner_key.public_hex:
+        raise SingularError(f"this owner key does not own agent {agent_id}")
     T.sign(transaction, request["chain_id"], "owner", owner_key)
     return ledger.submit(transaction)
 

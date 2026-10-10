@@ -149,7 +149,7 @@ def test_sell_the_agent(agent, ledger, owner, tmp_path):
     bought = A.import_capsule(capsule_path, tmp_path / "buyer", "capsule passphrase 1", ledger)
     assert not (bought.home / ".env").exists()
     request = A.transfer_request(bought, ledger, buyer_owner, "buyer passphrase 9")
-    A.transfer_approve(request, ledger, owner)
+    A.transfer_approve(request, ledger, owner, agent.agent_id)
     A.transfer_finalize(bought, ledger)
 
     record = ledger.get_agent(agent.agent_id)
@@ -200,7 +200,7 @@ def test_sale_capsule_carries_no_key_and_no_private_history(agent, ledger, owner
     assert "agent.keystore.json" not in names and "actions.jsonl" not in names and "actions.base.json" in names
     assert not (agent.sdir / "actions.base.json").exists()          # the seller's own home is left as it was
     bought = A.import_capsule(tmp_path / "sale.capsule", tmp_path / "buyer", "capsule passphrase 1", ledger)
-    A.transfer_approve(A.transfer_request(bought, ledger, SigningKey.generate(), "buyer passphrase 9"), ledger, owner)
+    A.transfer_approve(A.transfer_request(bought, ledger, SigningKey.generate(), "buyer passphrase 9"), ledger, owner, agent.agent_id)
     A.transfer_finalize(bought, ledger)
     g = SingularGuard(bought, ledger, "buyer passphrase 9", heartbeat=False)
     g.start()

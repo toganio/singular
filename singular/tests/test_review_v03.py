@@ -139,3 +139,48 @@ def test_capsule_refuses_an_oversized_pax_header(tmp_path):
     _evil_capsule(tmp_path / "c.cap", [(info, data)])
     with pytest.raises(CapsuleError, match="oversized"):
         capsule.unpack(tmp_path / "c.cap", tmp_path / "out", PASSWORD)
+
+
+# -- H4: the seller signs a transfer only for the agent they mean to sell -----------------------------
+
+def _request_for(ledger, chain, agent_id):
+    """What a buyer of a cheap agent can build for the seller's valuable one, from public ledger data alone."""
+    from singular.ledger import tx as T
+    buyer, new_agent = SigningKey.generate(), SigningKey.generate()
+    rec = ledger.get_agent(agent_id)
+    txn = T.build(T.TRANSFER, agent_id, rec["nonce"] + 1, {
+        "new_owner_pub": buyer.public_hex, "new_agent_pub": new_agent.public_hex, "new_enc_pub": new_agent.enc_public_hex,
+        "root": rec["seal"]["root"], "memory_root": ledger.get_bank(rec["memory_bank"])["seal"]["root"]})
+    T.sign(txn, chain.chain_id, "new_owner", buyer)
+    T.sign(txn, chain.chain_id, "new_agent", new_agent)
+    return {"kind": "singular-transfer-request", "chain_id": chain.chain_id, "tx": txn}, buyer
+
+
+def test_transfer_approve_refuses_a_request_for_a_different_agent(agent, ledger, chain, owner, tmp_path):
+    from singular.errors import SingularError
+    valuable = A.init_agent(make_home(tmp_path / "valuable"), ledger, "local", owner, PASS, name="Valuable", function="x")
+    request, buyer = _request_for(ledger, chain, valuable.agent_id)
+    with pytest.raises(SingularError, match="not " + agent.agent_id):
+        A.transfer_approve(request, ledger, owner, agent.agent_id)       # the seller meant to sell the cheap one
+    assert ledger.get_agent(valuable.agent_id)["owner_pub"] == owner.public_hex
+    with pytest.raises(SingularError, match="does not own"):
+        A.transfer_approve(request, ledger, SigningKey.generate(), valuable.agent_id)
+
+
+def test_cli_transfer_approve_needs_the_agent_and_works_without_ledger_flag(agent, ledger, chain, owner, tmp_path,
+                                                                           monkeypatch, capsys):
+    from singular import cli
+    from singular.keys import save_keystore, wrap_key
+    valuable = A.init_agent(make_home(tmp_path / "valuable"), ledger, "local", owner, PASS, name="Valuable", function="x")
+    request, buyer = _request_for(ledger, chain, valuable.agent_id)
+    (tmp_path / "req.json").write_text(json.dumps(request))
+    save_keystore(tmp_path / "owner.json", wrap_key(owner, PASS, label="owner"))
+    monkeypatch.setenv("SINGULAR_OWNER_PASSPHRASE", PASS)
+    monkeypatch.setattr(cli, "open_ledger", lambda url: ledger)       # the agent's stored ledger url is "local"
+    args = ["transfer", "approve", "--file", str(tmp_path / "req.json"), "--owner-key", str(tmp_path / "owner.json")]
+    assert cli.dispatch(cli.build_parser().parse_args(args + ["--home", str(agent.home)])) == 1   # no --ledger: no crash
+    assert "refusing to sign" in capsys.readouterr().err
+    assert cli.dispatch(cli.build_parser().parse_args(args + ["--home", str(valuable.home)])) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["sold"] == valuable.agent_id and out["name"] == "Valuable" and out["new_owner_pub"] == buyer.public_hex
+    assert ledger.get_agent(valuable.agent_id)["owner_pub"] == buyer.public_hex
