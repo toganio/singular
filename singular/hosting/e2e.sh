@@ -17,8 +17,9 @@ REGISTRY_IMAGE="${REGISTRY_IMAGE:-registry:2}"
 COMMAND="${E2E_COMMAND:-hermes gateway run}"
 
 cleanup() {
-  docker rm -f "$RUN_ID-agent" "$RUN_ID-ledger" "$RUN_ID-registry" >/dev/null 2>&1 || true
-  docker volume rm "$RUN_ID-home" "$RUN_ID-chain" >/dev/null 2>&1 || true
+  docker rm -f "$RUN_ID-agent" "$RUN_ID-copy" "$RUN_ID-ledger" "$RUN_ID-registry" >/dev/null 2>&1 || true
+  docker volume rm "$RUN_ID-home" "$RUN_ID-home-bo" "$RUN_ID-home-copy" "$RUN_ID-chain" >/dev/null 2>&1 || true
+  docker rmi "$RUN_ID-bo:v1" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -98,5 +99,42 @@ wait_log '"imported": false'
 [ "$(lease)" = held ] && echo "ledger: lease held again"
 docker stop -t 60 "$RUN_ID-agent" >/dev/null
 [ "$(lease)" = free ] && echo "ledger: lease released"
+docker rm "$RUN_ID-agent" >/dev/null
 
-printf '\nPASS: pull, verify, run under the lease, release on stop, restart from the volume\n'
+step "standalone: bake a second agent into its own image with \`singular pack\`, as one file"
+docker save "$IMAGE" -o "$WORK/runtime.tar"
+chmod 644 "$WORK/runtime.tar"
+mkdir -p "$WORK/bo" && printf 'You are Bo, a travel planner.\n' > "$WORK/bo/SOUL.md"
+docker run --rm --network "$NET" -v "$WORK:/work" --user "$(id -u):$(id -g)" -e HOME=/work "${export_env[@]}" \
+  -e SINGULAR_ALLOW_INSECURE_LEDGER=1 --entrypoint sh "$IMAGE" -c '
+    set -e
+    singular init --owner-key /work/owner.keystore.json --ledger http://ledger:8765 --home /work/bo \
+      --name Bo --function "e2e travel planner" --lease-ttl 120 > /work/bo-init.json
+    singular export --home /work/bo --move --out /work/bo.capsule >/dev/null
+    singular pack /work/bo.capsule --ledger http://ledger:8765 --base /work/runtime.tar --out /work/bo.tar --tag "'"$RUN_ID"'-bo:v1" > /work/pack.json'
+cat "$WORK/pack.json"
+rm -f "$WORK/runtime.tar"
+AGENT_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_id"])' "$WORK/bo-init.json")"
+docker load -i "$WORK/bo.tar"
+BO_IMAGE="$RUN_ID-bo:v1"
+
+step "run it: only a volume and the agent's passphrases, no capsule source, no ledger setting"
+start_bo() {  # name, volume
+  docker run -d --name "$1" --network "$NET" -v "$2:/agent/home" -e SINGULAR_PASSPHRASE=agent-pass-e2e \
+    -e SINGULAR_CAPSULE_PASSPHRASE=capsule-pass-e2e -e SINGULAR_ALLOW_INSECURE_LEDGER=1 "$BO_IMAGE" $COMMAND >/dev/null
+}
+start_bo "$RUN_ID-agent" "$RUN_ID-home-bo"
+wait_log "singular-host: running"
+docker logs "$RUN_ID-agent" 2>&1 | grep "singular-host: running"
+[ "$(lease)" = held ] && echo "ledger: Bo's lease held by its own image"
+
+step "a copy of the same image on a second volume cannot run while the first lives"
+start_bo "$RUN_ID-copy" "$RUN_ID-home-copy"
+for _ in $(seq 60); do [ "$(docker inspect -f '{{.State.Running}}' "$RUN_ID-copy")" = false ] && break; sleep 1; done
+docker logs "$RUN_ID-copy" 2>&1 | grep "singular-host: failed"
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$RUN_ID-copy")" != 0 ] && echo "copy refused"
+docker logs "$RUN_ID-agent" 2>&1 | grep -q "singular-host: running" && [ "$(lease)" = held ] && echo "the first one keeps running"
+docker stop -t 60 "$RUN_ID-agent" >/dev/null
+[ "$(lease)" = free ] && echo "ledger: lease released"
+
+printf '\nPASS: pull, verify, run under the lease, release on stop, restart from the volume; a packed image runs alone and its copies cannot run beside it\n'

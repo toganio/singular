@@ -137,8 +137,8 @@ class Registry:
     def _open(self, method: str, url: str, *, data: bytes | None = None, headers: dict | None = None):
         for attempt in (0, 1):
             request = urllib.request.Request(url, data=data, method=method, headers=dict(headers or {}))
-            if self._auth:
-                request.add_header("Authorization", self._auth)
+            if self._auth:  # unredirected: a blob redirect to a CDN must not carry the registry login along
+                request.add_unredirected_header("Authorization", self._auth)
             try:
                 return urllib.request.urlopen(request, timeout=self.timeout)  # noqa: S310 - operator-named registry
             except urllib.error.HTTPError as exc:
@@ -215,7 +215,17 @@ class Registry:
                 return False
             raise
 
-    def _upload(self, repository: str, data: bytes, digest: str) -> None:
+    def mount(self, repository: str, digest: str, from_repository: str) -> bool:
+        """Borrow a blob another repository on this registry holds, without copying it. False if refused."""
+        url = f"{self.base}{repository}/blobs/uploads/?" + urllib.parse.urlencode({"mount": digest, "from": from_repository})
+        try:
+            with self._open("POST", url, data=b"") as response:
+                return response.status == 201   # 202 means the registry opened a plain upload instead
+        except CapsuleError:
+            return False
+
+    def _upload(self, repository: str, data, digest: str, size: int | None = None) -> None:
+        """Upload a blob (bytes, or an open binary file of ``size`` bytes) unless the repository has it."""
         if self._blob_exists(repository, digest):
             return
         with self._open("POST", f"{self.base}{repository}/blobs/uploads/", data=b"") as response:
@@ -224,7 +234,30 @@ class Registry:
             raise CapsuleError("registry gave no upload location")
         location = urllib.parse.urljoin(self.base, location)
         location += ("&" if "?" in location else "?") + urllib.parse.urlencode({"digest": digest})
-        with self._open("PUT", location, data=data, headers={"Content-Type": "application/octet-stream"}):
+        headers = {"Content-Type": "application/octet-stream"}
+        if not isinstance(data, bytes | bytearray):
+            headers["Content-Length"] = str(size)
+        with self._open("PUT", location, data=data, headers=headers):
+            pass
+
+    # -- plain images (``singular pack`` reads a base image and writes an agent image) ----------
+
+    def get_manifest(self, repository: str, target: str, accept: tuple[str, ...]) -> tuple[bytes, str]:
+        """Any manifest or index, checked against the digest when ``target`` is one. Returns (raw, mediaType)."""
+        with self._open("GET", f"{self.base}{repository}/manifests/{target}", headers={"Accept": ", ".join(accept)}) as response:
+            raw = response.read(MAX_MANIFEST + 1)
+            content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+        if len(raw) > MAX_MANIFEST:
+            raise CapsuleError("manifest is unreasonably large")
+        if _DIGEST.match(target) and "sha256:" + hashlib.sha256(raw).hexdigest() != target:
+            raise CapsuleError(f"registry served a manifest that does not hash to {target}")
+        return raw, content_type
+
+    def open_blob(self, repository: str, digest: str):
+        return self._open("GET", f"{self.base}{repository}/blobs/{digest}")
+
+    def put_manifest(self, repository: str, tag: str, raw: bytes, media_type: str) -> None:
+        with self._open("PUT", f"{self.base}{repository}/manifests/{tag}", data=raw, headers={"Content-Type": media_type}):
             pass
 
     def push(self, capsule_path: Path, ref: Reference) -> dict:

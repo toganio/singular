@@ -110,6 +110,7 @@ singular/src/singular/
   ledger/                     tx · state (rules) · chain (blocks) · node (HTTP) · client
   oci.py                      capsules as OCI artifacts (push / pull)
   hosting.py                  `singular host`, the supervisor inside the runtime image
+  pack.py                     `singular pack`, one agent baked into one standalone image
   hermes_plugin.py cli.py demo.py
 singular/hosting/             the hosted-agent runtime image (Dockerfile, end-to-end test)
 ```

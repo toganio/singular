@@ -203,9 +203,16 @@ def _call_forwarding_signals(command: list[str]) -> int:
     return code
 
 
-def cmd_host(args) -> int:  # noqa: ARG001 - configured by environment (see singular.hosting)
+def cmd_host(args) -> int:  # configured by environment (see singular.hosting); arguments replace SINGULAR_COMMAND
     from . import hosting
-    return hosting.main()
+    return hosting.main(args.command[1:] if args.command[:1] == ["--"] else args.command)
+
+
+def cmd_pack(args) -> int:
+    from . import pack
+    _print(pack.pack(Path(args.capsule), args.ledger, base=args.base, push_to=args.push,
+                     out=Path(args.out) if args.out else None, tag=args.tag, platform=args.platform))
+    return 0
 
 
 def cmd_export(args) -> int:
@@ -366,7 +373,18 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     add("restore", cmd_restore, "put files back to the last sealed state", home=True)
     p = add("run", cmd_run, "verify, take the run lease, run a command, seal and release", home=True)
     p.add_argument("command", nargs=argparse.REMAINDER)
-    add("host", cmd_host, "container supervisor: import on first start, run under the lease, report (configured by SINGULAR_* env)")
+    p = add("host", cmd_host, "container supervisor: import on first start, run under the lease, report (configured by SINGULAR_* env)")
+    p.add_argument("command", nargs=argparse.REMAINDER, help="what to run under the lease (default: $SINGULAR_COMMAND)")
+    p = add("pack", cmd_pack, "bake an `export --move` capsule into a standalone image that runs with one `docker run`")
+    p.add_argument("capsule")
+    p.add_argument("--ledger", required=True, help="the agent's ledger url, baked into the image")
+    p.add_argument("--base", default=None, help="runtime image: a registry reference or a `docker save` archive "
+                   "(default: the published singular-runtime for this version)")
+    where = p.add_mutually_exclusive_group(required=True)
+    where.add_argument("--push", help="registry/repo:tag to push the image to (prints the digest to pin)")
+    where.add_argument("--out", help="write the image as one file (OCI archive for `docker load` / `podman load`)")
+    p.add_argument("--tag", help="--out: the name `docker load` gives it, e.g. ada:latest")
+    p.add_argument("--platform", default="linux/amd64")
     p = add("export", cmd_export, "pack the agent into an encrypted capsule", home=True)
     p.add_argument("--out", required=True)
     p.add_argument("--move", action="store_true", help="moving your OWN agent: include its key and action records (never use for a sale)")

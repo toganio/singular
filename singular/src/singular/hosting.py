@@ -13,7 +13,8 @@ Run worker pool, a customer's own machine) can start the same image the same way
                                 keys stay in this process; every other line becomes the agent's ``.env``
                                 (the customer's model key and the like).
 ``SINGULAR_CONFIG``             a ``config.yaml`` to install (the agent's model / platform settings)
-``SINGULAR_COMMAND``            what to run under the lease (default ``hermes gateway run``)
+``SINGULAR_COMMAND``            what to run under the lease (default ``hermes gateway run``); arguments
+                                after the image name in ``docker run`` replace it
 ``SINGULAR_REPORT_URL``         optional control plane endpoint; state changes are POSTed there
 ``SINGULAR_REPORT_TOKEN``       bearer token for it (put it in the secrets file)
 ==============================  =====================================================================
@@ -185,7 +186,8 @@ def prepare_home(home_path: Path, ledger_url: str, env: dict[str, str]) -> tuple
     return A.AgentHome(home_path), {"imported": True, **fetched}
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 - configured by environment only
+def main(argv: list[str] | None = None) -> int:
+    """``argv``, when given, is the command to run under the lease (``docker run IMAGE hermes`` for a chat)."""
     env = dict(os.environ)
     secrets_own, dotenv = load_secrets(Path(env.get("SINGULAR_SECRETS_FILE", DEFAULT_SECRETS)))
     env.update(secrets_own)
@@ -218,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 - configured by 
             os.environ.pop(key, None)
         report("running", agent_id=started["agent_id"], lease=started["lease"]["no"], epoch=started["epoch"], **how)
         agent_id = guard.agent_id
-        code = run_guarded(guard, shlex.split(env.get("SINGULAR_COMMAND", DEFAULT_COMMAND)),
+        code = run_guarded(guard, list(argv) if argv else shlex.split(env.get("SINGULAR_COMMAND", DEFAULT_COMMAND)),
                            on_hard_exit=lambda c: report("stopped", agent_id=agent_id, exit_code=c))
         guard.stop()
         report("stopped", agent_id=guard.agent_id, exit_code=code)

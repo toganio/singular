@@ -40,6 +40,8 @@ USER agent
 WORKDIR /agent
 VOLUME ["/agent/home"]
 
+# `singular pack` builds agent images on this one and refuses any base without this label.
+LABEL dev.singular.runtime="1"
 ENV SINGULAR_HOME=/agent/home \
     HERMES_HOME=/agent/home
 
