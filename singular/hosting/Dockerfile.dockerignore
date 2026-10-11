@@ -1,0 +1,22 @@
+# BuildKit reads this file for `-f singular/hosting/Dockerfile` (it takes precedence over the root .dockerignore).
+.git
+**/__pycache__
+**/*.pyc
+**/.venv*
+**/node_modules
+**/*.egg-info
+**/.pytest_cache
+.github
+docs
+website
+web
+apps
+ui-tui
+tests
+tests-js
+evals
+assets
+singular/tests
+**/*.capsule
+**/*.keystore.json
+**/*.db

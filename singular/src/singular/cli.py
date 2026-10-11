@@ -4,11 +4,14 @@ history and ``ps``): they come from environment variables or an interactive prom
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from . import __version__, agent as A, tree
@@ -121,26 +124,91 @@ def cmd_run(args) -> int:
     guard = SingularGuard(home, _ledger_for(home, args), _secret("SINGULAR_PASSPHRASE", "Agent passphrase"))
     started = guard.start()
     print(f"singular: {started['agent_id']} holds the run lease #{started['lease']['no']}", file=sys.stderr)
-    os.environ["HERMES_HOME"] = str(home.home)
-    os.environ.pop("SINGULAR_PASSPHRASE", None)
     try:
-        if command[0] == "hermes":
-            try:
-                from hermes_cli.main import main as hermes_main  # same process: the plugin logs every tool call
-            except ImportError:
-                hermes_main = None
-            if hermes_main is not None:
-                from . import hermes_plugin
-                hermes_plugin.adopt_guard(guard)
-                sys.argv = command
+        return run_guarded(guard, command)
+    finally:
+        guard.stop()
+        print("singular: sealed and released", file=sys.stderr)
+
+
+def run_guarded(guard: SingularGuard, command: list[str], *, on_hard_exit=None) -> int:
+    """Run ``command`` while ``guard`` holds the lease. The caller stops the guard afterwards.
+
+    ``hermes`` runs in this process so the plugin logs every tool call under this lease. Anything else runs
+    as a child that receives our SIGTERM / SIGINT, so ``docker stop`` ends it and we still seal and release.
+    ``on_hard_exit(code)`` runs after the release when Hermes leaves through ``os._exit``."""
+    os.environ["HERMES_HOME"] = str(guard.home.home)
+    os.environ.pop("SINGULAR_PASSPHRASE", None)
+    if command[0] == "hermes":
+        try:
+            from hermes_cli.main import main as hermes_main  # same process: the plugin logs every tool call
+        except ImportError:
+            hermes_main = None
+        if hermes_main is not None:
+            from . import hermes_plugin
+            hermes_plugin.adopt_guard(guard)
+            sys.argv = command
+            with _stop_before_hard_exit(guard, on_hard_exit):
                 try:
                     return int(hermes_main() or 0)
                 except SystemExit as exc:
                     return int(exc.code or 0) if not isinstance(exc.code, str) else 1
-        return subprocess.call(command)  # noqa: S603 - the operator's own command
+    return _call_forwarding_signals(command)
+
+
+@contextlib.contextmanager
+def _stop_before_hard_exit(guard: SingularGuard, after=None):
+    """Hermes ends a gateway run with ``os._exit`` once its own graceful teardown is done (so a wedged worker
+    thread cannot block interpreter shutdown). That skips our ``finally`` and every ``atexit`` handler, and the
+    lease would only lapse by TTL. Seal and release first, then exit as Hermes asked."""
+    real_exit = os._exit
+
+    def _exit(code: int = 0) -> None:
+        try:
+            guard.stop()
+            print("singular: sealed and released", file=sys.stderr)
+            if after is not None:
+                after(code)
+        except Exception as exc:  # noqa: BLE001 - never block the exit itself
+            print(f"singular: release before exit failed: {exc}", file=sys.stderr)
+        finally:
+            for stream in (sys.stdout, sys.stderr):  # os._exit does not flush; keep what we printed
+                with contextlib.suppress(Exception):
+                    stream.flush()
+            real_exit(code)
+
+    os._exit = _exit
+    try:
+        yield
     finally:
-        guard.stop()
-        print("singular: sealed and released", file=sys.stderr)
+        os._exit = real_exit
+
+
+def _call_forwarding_signals(command: list[str]) -> int:
+    """Run a child; pass it our SIGTERM / SIGINT. A child that ends on the signal we passed was *stopped*, not
+    crashed, so that is exit 0; any other death by signal is the shell's 128 + n."""
+    proc = subprocess.Popen(command)  # noqa: S603 - the operator's own command
+    forwarded: list[int] = []
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        def _forward(signum, _frame):
+            forwarded.append(signum)
+            proc.send_signal(signum)
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous[sig] = signal.signal(sig, _forward)
+    try:
+        code = proc.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if code < 0:
+        return 0 if -code in forwarded else 128 - code
+    return code
+
+
+def cmd_host(args) -> int:  # noqa: ARG001 - configured by environment (see singular.hosting)
+    from . import hosting
+    return hosting.main()
 
 
 def cmd_export(args) -> int:
@@ -301,6 +369,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     add("restore", cmd_restore, "put files back to the last sealed state", home=True)
     p = add("run", cmd_run, "verify, take the run lease, run a command, seal and release", home=True)
     p.add_argument("command", nargs=argparse.REMAINDER)
+    add("host", cmd_host, "container supervisor: import on first start, run under the lease, report (configured by SINGULAR_* env)")
     p = add("export", cmd_export, "pack the agent into an encrypted capsule", home=True)
     p.add_argument("--out", required=True)
     p.add_argument("--move", action="store_true", help="moving your OWN agent: include its key and action records (never use for a sale)")

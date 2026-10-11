@@ -108,7 +108,10 @@ singular/src/singular/
   actions.py                  liability log
   bank.py                     external memory banks
   ledger/                     tx · state (rules) · chain (blocks) · node (HTTP) · client
+  oci.py                      capsules as OCI artifacts (push / pull)
+  hosting.py                  `singular host`, the supervisor inside the runtime image
   hermes_plugin.py cli.py demo.py
+singular/hosting/             the hosted-agent runtime image (Dockerfile, end-to-end test)
 ```
 
 MIT licensed, like Hermes Agent.
