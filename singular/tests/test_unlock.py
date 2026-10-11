@@ -201,3 +201,13 @@ def test_unlock_cli_roundtrip(agent, ledger, owner, monkeypatch, capsys):
     assert U.main("describe", str(agent.home), ledger) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["agent_id"] == agent.agent_id
+
+
+def test_unlock_apply_from_a_file(agent, ledger, owner, tmp_path, capsys):
+    allow(agent, ledger, owner)
+    edits = [{"p": "memories/MEMORY.md", "text": "- from a file\n"}]
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"edits": edits, "txs": signed_seals(agent, ledger, owner, edits)}))
+    assert unlock.main("apply", str(agent.home), ledger, str(request)) == 0
+    assert set(json.loads(capsys.readouterr().out)["receipts"]) == {"memory"}
+    assert (agent.home / "memories/MEMORY.md").read_text() == "- from a file\n"

@@ -212,7 +212,7 @@ def cmd_unlock(args) -> int:
     from . import unlock
     home = args.home or os.environ.get("SINGULAR_HOME") or os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
     url = args.ledger or os.environ.get("SINGULAR_LEDGER") or A.AgentHome(home).identity["ledger_url"]
-    return unlock.main(args.step, home, open_ledger(url))
+    return unlock.main(args.step, home, open_ledger(url), args.input)
 
 
 def cmd_export(args) -> int:
@@ -380,6 +380,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p.add_argument("step", choices=["describe", "apply"])
     p.add_argument("--home", help="agent home (default: $SINGULAR_HOME, $HERMES_HOME or ~/.hermes)")
     p.add_argument("--ledger", help="ledger url (default: $SINGULAR_LEDGER, then the one stored in the agent)")
+    p.add_argument("--input", help="apply: read the request from this file instead of stdin")
     p = add("export", cmd_export, "pack the agent into an encrypted capsule", home=True)
     p.add_argument("--out", required=True)
     p.add_argument("--move", action="store_true", help="moving your OWN agent: include its key and action records (never use for a sale)")

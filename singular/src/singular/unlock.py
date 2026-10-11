@@ -9,7 +9,7 @@ Both commands read one JSON object on stdin and print one on stdout, so a runner
 container on the agent's volume (``SINGULAR_HOME``, ``SINGULAR_LEDGER``) without any network port.
 
     describe   {}                                         -> agent id, sealed entries, text of editable files
-    apply      {"edits": [...], "txs": [...]}             -> receipts
+    apply      {"edits": [...], "txs": [...]}             -> receipts   (stdin, or ``--input FILE``)
 
 An edit is ``{"p": "skills/x/SKILL.md", "text": "..."}`` (create or replace, UTF-8) or ``{"p": ..., "delete": true}``.
 """
@@ -247,11 +247,15 @@ def apply(agent_home: A.AgentHome, ledger: Ledger, request: dict) -> dict:
     return {"receipts": receipts}
 
 
-def main(command: str, home: str, ledger: Ledger) -> int:
+def main(command: str, home: str, ledger: Ledger, input_path: str | None = None) -> int:
     agent_home = A.AgentHome(home)
     if not agent_home.is_singular:
         raise SingularError(f"{home} holds no Singular agent")
-    raw = sys.stdin.buffer.read(8 << 20).decode("utf-8") if command == "apply" else "{}"
+    raw = "{}"
+    if command == "apply":
+        source = open(input_path, "rb") if input_path else sys.stdin.buffer  # noqa: SIM115
+        with source:
+            raw = source.read(8 << 20).decode("utf-8")
     try:
         request = json.loads(raw or "{}")
     except ValueError:
