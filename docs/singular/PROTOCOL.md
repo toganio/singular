@@ -58,6 +58,7 @@ of signer roles below must be present, no more, no fewer. "now" is the enclosing
 | `ROLLBACK` | owner | no live lease; target root was sealed before; body `{seq, prev_root, root, files, bytes}` (files/bytes of the target; bodies without them, from before v0.3, keep the current counts) | new seal, kind `rollback` |
 | `OWNER_ATTEST` | owner | no live lease; policy `allow_owner_attest` | new seal, kind `owner_attest` |
 | `ROTATE_KEY` | owner, new_agent | new key is fresh (works even while a lease is held: the holder may be the thief) | agent/enc keys replaced, lease dropped, `epoch+1`, `rotations+1` |
+| `PACKAGE` | agent | no live lease; `root`, `memory_root` and `actions_head` equal the current ones; body also `{capsule, image}` (sha256 hex of the capsule file and the image manifest) | `package {no+1, capsule, image, ts}`: the newest one-file package; hosts refuse older copies |
 | `RETIRE` | owner | — | agent frozen forever |
 | `BANK_CREATE` | owner | id matches; nonce 1 | external bank, key_gen 1 |
 | `BANK_GRANT` | bank owner | external; agent active; `key_gen` current | grant `{rights r\|rw, epoch, key_gen, wrapped_key, expires}` |

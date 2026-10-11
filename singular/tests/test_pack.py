@@ -156,3 +156,110 @@ def test_platform_selection_names_what_is_missing(world):
     with pytest.raises(CapsuleError, match="linux/riscv64"):
         pack.open_base(base, "linux/riscv64")
     assert oci.parse_reference(base).tag == "0.1.0"
+
+
+# -- the package: one file that holds the living agent and is rewritten after each run ----------------
+
+def _package(world, tmp_path, name="ada.tar"):
+    _, node, ledger, agent, registry = world
+    out = tmp_path / "pkg" / name
+    out.parent.mkdir(exist_ok=True)
+    pack.pack(export(agent, ledger, tmp_path / "ada.capsule"), node.url, base=fake_runtime(registry), out=out, tag="ada:v1")
+    return out
+
+
+def _run_once(home, ledger, text):
+    from singular.runtime import SingularGuard
+    from conftest import PASS, agent_writes
+    guard = SingularGuard(home, ledger, PASS)
+    guard.start()
+    agent_writes(guard, "memories/MEMORY.md", text)
+    guard.stop()
+
+
+def test_package_round_trip_and_repack_in_place(world, tmp_path):
+    _, node, _, agent, _ = world
+    out = _package(world, tmp_path)
+    info = pack.package_info(out)
+    assert info["agent_id"] == agent.agent_id and info["tag"] == "ada:v1"
+    opened = pack.open_package(out)
+    config = opened.config
+    opened.close()
+    assert f"SINGULAR_PACKAGE={pack.PACKAGE_DIR}/ada.tar" in config["config"]["Env"]
+    extracted = pack.extract_capsule(out, tmp_path / "x.capsule")
+    assert extracted["capsule_digest"] == _sha((tmp_path / "ada.capsule").read_bytes())
+
+    (tmp_path / "other.capsule").write_bytes((tmp_path / "ada.capsule").read_bytes())
+    result = pack.repack(out, tmp_path / "other.capsule", node.url)
+    after = pack.open_package(out)
+    try:
+        assert after.tag == "ada:v1" and len(after.layers) == 2       # runtime layers kept, capsule replaced
+        assert after.config["config"]["Labels"]["org.opencontainers.image.base.name"].endswith("singular-runtime:0.1.0")
+        assert after.config["rootfs"]["diff_ids"][-1] == after.layers[-1]["digest"]
+        assert len(after.config["history"]) == 2
+    finally:
+        after.close()
+    assert result["manifest_digest"] == pack.package_info(out)["image"]
+    assert not list(out.parent.glob(".singular-*")) and not list(out.parent.glob("*.part"))
+    with pytest.raises(CapsuleError, match="no agent in it"):   # a plain runtime image is not a package
+        pack._check_runtime({"config": {"Labels": {"dev.singular.runtime": "1"}}, "rootfs": {"type": "layers"}}, "x", agent=True)
+
+
+def test_the_package_file_carries_the_living_agent(world, tmp_path):
+    """Start from the file, run, rewrite the file, record it; the old copy of the file is now refused."""
+    _, node, ledger, agent, _ = world
+    out = _package(world, tmp_path)
+    old_copy = tmp_path / "old-ada.tar"
+    old_copy.write_bytes(out.read_bytes())
+    from conftest import PASS
+    env = {"SINGULAR_PACKAGE": str(out), "SINGULAR_CAPSULE": pack.CAPSULE_IN_IMAGE,
+           "SINGULAR_CAPSULE_PASSPHRASE": CAPSULE_PASS, "SINGULAR_PASSPHRASE": PASS}
+    home, how = hosting.prepare_home(tmp_path / "vol1", node.url, env)
+    assert how["source"] == "package" and home.agent_id == agent.agent_id
+
+    _run_once(home, ledger, "- learned that the client is in Ankara\n")
+    reports = []
+    info = hosting.repack_package(home, node.url, env, lambda state, **f: reports.append((state, f)))
+    assert info["no"] == 1 and reports[-1][0] == "packaged"
+    record = ledger.get_agent(agent.agent_id)
+    assert record["package"]["capsule"] == info["capsule_digest"].removeprefix("sha256:")
+    assert record["package"]["image"] == pack.package_info(out)["image"].removeprefix("sha256:")
+
+    # a second machine, nothing but the new file: the agent comes back with what it learned
+    home2, how2 = hosting.prepare_home(tmp_path / "vol2", node.url, env)
+    assert "Ankara" in (home2.home / "memories" / "MEMORY.md").read_text()
+    # the old copy of the file is refused by name, before anything is unpacked
+    with pytest.raises(SingularError, match="old copy"):
+        hosting.prepare_home(tmp_path / "vol3", node.url, {**env, "SINGULAR_PACKAGE": str(old_copy)})
+
+
+def test_package_records_follow_the_ledger_rules(world, tmp_path):
+    from singular.keys import SigningKey
+    from singular.ledger import tx as T
+    from singular.errors import LedgerRejected
+    from singular.runtime import SingularGuard
+    from conftest import PASS
+    from singular import agent as A
+    _, node, ledger, agent, _ = world
+    key = agent.unlock(PASS)
+    A.record_package(agent, ledger, key, "sha256:" + "1" * 64, "sha256:" + "2" * 64)
+    assert ledger.get_agent(agent.agent_id)["package"]["no"] == 1
+    guard = SingularGuard(agent, ledger, PASS)
+    guard.start()
+    try:
+        with pytest.raises(LedgerRejected, match="LEASE_HELD"):   # never while a copy is running
+            A.record_package(agent, ledger, key, "sha256:" + "3" * 64, "sha256:" + "4" * 64)
+    finally:
+        guard.stop()
+    record = ledger.get_agent(agent.agent_id)
+    body = {"capsule": "5" * 64, "image": "6" * 64, "root": "7" * 64,
+            "memory_root": "8" * 64, "actions_head": record["actions"]["head"]}
+    with pytest.raises(LedgerRejected, match="STALE_STATE"):       # only for the current state
+        A.submit(ledger, agent.identity["chain_id"], T.PACKAGE, agent.agent_id, record["nonce"] + 1, body, {"agent": key})
+    report = A.verify(agent, ledger)
+    body.update(root=report["core"]["root"], memory_root=report["memory"]["root"])
+    with pytest.raises(LedgerRejected, match="BAD_SIGNATURE"):     # only the agent's own key
+        A.submit(ledger, agent.identity["chain_id"], T.PACKAGE, agent.agent_id, record["nonce"] + 1, body,
+                 {"agent": SigningKey.generate()})
+    A.submit(ledger, agent.identity["chain_id"], T.PACKAGE, agent.agent_id, record["nonce"] + 1, body, {"agent": key})
+    assert ledger.get_agent(agent.agent_id)["package"]["no"] == 2

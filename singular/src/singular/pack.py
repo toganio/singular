@@ -60,7 +60,8 @@ _LAYER_TYPES = {
     "application/vnd.oci.image.layer.v1.tar": OCI_LAYER_TAR,
     "application/vnd.docker.image.rootfs.diff.tar": OCI_LAYER_TAR,
 }
-_OURS = ("SINGULAR_CAPSULE", "SINGULAR_CAPSULE_DIGEST", "SINGULAR_LEDGER")
+_OURS = ("SINGULAR_CAPSULE", "SINGULAR_CAPSULE_DIGEST", "SINGULAR_LEDGER", "SINGULAR_PACKAGE")
+PACKAGE_DIR = "/package"   # where a host mounts the folder holding the agent's one-file package
 _MAX_CONFIG = 1 << 20
 _NAME = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
 
@@ -96,6 +97,7 @@ class Base:
     open_blob: Callable[[str], contextlib.AbstractContextManager]
     registry: str | None = None      # set when it lives in a registry, so a push there can mount its layers
     repository: str | None = None
+    tag: str | None = None           # an agent archive: the name `docker load` gives it
     _close: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -103,12 +105,14 @@ class Base:
             closer()
 
 
-def _check_runtime(config: dict, name: str) -> None:
+def _check_runtime(config: dict, name: str, agent: bool = False) -> None:
     labels = (config.get("config") or {}).get("Labels") or {}
     if labels.get(RUNTIME_LABEL) != "1":
         raise CapsuleError(f"{name} is not a Singular runtime image (no {RUNTIME_LABEL} label); "
                            "build singular/hosting/Dockerfile or use the published runtime")
-    if f"{oci.ANNOTATION_PREFIX}agent_id" in labels:
+    if agent and f"{oci.ANNOTATION_PREFIX}capsule_digest" not in labels:
+        raise CapsuleError(f"{name} is a runtime image with no agent in it")
+    if not agent and f"{oci.ANNOTATION_PREFIX}agent_id" in labels:
         raise CapsuleError(f"{name} already holds an agent ({labels[oci.ANNOTATION_PREFIX + 'agent_id']}); "
                            "pack on the plain runtime image")
     if config.get("rootfs", {}).get("type") != "layers":
@@ -154,7 +158,7 @@ def open_registry_base(ref_text: str, platform: str = DEFAULT_PLATFORM, *, crede
                 open_blob=lambda d: reg.open_blob(ref.repository, d), registry=ref.registry, repository=ref.repository)
 
 
-def open_archive_base(path: Path, platform: str = DEFAULT_PLATFORM) -> Base:
+def open_archive_base(path: Path, platform: str = DEFAULT_PLATFORM, *, agent: bool = False) -> Base:
     """A ``docker save`` / ``podman save`` archive: an OCI image layout (``index.json``), or Docker's older
     ``manifest.json`` format."""
     tar = tarfile.open(path, "r:")
@@ -216,14 +220,95 @@ def open_archive_base(path: Path, platform: str = DEFAULT_PLATFORM) -> Base:
         config = json.loads(config_raw)
         if _sha(config_raw) != manifest["config"]["digest"]:
             raise CapsuleError(f"{path}: the image config does not match its digest")
-        _check_runtime(config, str(path))
+        _check_runtime(config, str(path), agent)
         if digest is None:  # what the base manifest would have been, so the label still names it exactly
             digest = _sha(json.dumps(manifest, sort_keys=True).encode())
-        return Base(name=Path(path).name, digest=digest, config=config, layers=_layers(manifest, config),
+        base = Base(name=Path(path).name, digest=digest, config=config, layers=_layers(manifest, config),
                     open_blob=open_blob, _close=[tar.close])
+        if agent:
+            legacy = names.get("manifest.json")
+            tags = json.loads(tar.extractfile(legacy).read(_MAX_CONFIG)) if legacy else [{}]
+            base.tag = (tags[0].get("RepoTags") or [None])[0]
+        return base
     except BaseException:
         tar.close()
         raise
+
+
+# -- the package: an agent archive that is rewritten after each run ---------------------------------
+
+def _labels(config: dict) -> dict:
+    return (config.get("config") or {}).get("Labels") or {}
+
+
+def open_package(path: Path, platform: str = DEFAULT_PLATFORM) -> Base:
+    """An agent archive made by ``pack --out`` (or rewritten by a host): the agent image, capsule layer last."""
+    return open_archive_base(Path(path), platform, agent=True)
+
+
+def package_info(path: Path) -> dict:
+    package = open_package(path)
+    try:
+        labels = _labels(package.config)
+        return {"agent_id": labels.get(f"{oci.ANNOTATION_PREFIX}agent_id"), "image": package.digest,
+                "capsule_digest": labels.get(f"{oci.ANNOTATION_PREFIX}capsule_digest"), "tag": package.tag}
+    finally:
+        package.close()
+
+
+def extract_capsule(path: Path, out: Path) -> dict:
+    """Take the capsule out of a package file; it must hash to what the image's labels say."""
+    package = open_package(path)
+    try:
+        expected = _labels(package.config)[f"{oci.ANNOTATION_PREFIX}capsule_digest"]
+        layer = package.layers[-1]
+        with tempfile.TemporaryFile() as spool:
+            with package.open_blob(layer["digest"]) as source:
+                reader = _Hashing(source)
+                shutil.copyfileobj(reader, spool, 1 << 20)
+            reader.check(layer)
+            spool.seek(0)
+            with tarfile.open(fileobj=spool, mode="r:") as tar:
+                member = tar.getmember(CAPSULE_IN_IMAGE.lstrip("/"))
+                if not member.isfile() or member.size > capsule.MAX_UNPACKED_BYTES:
+                    raise CapsuleError("the package's capsule layer is malformed")
+                hasher = hashlib.sha256()
+                with tar.extractfile(member) as data, open(out, "wb") as handle:
+                    while block := data.read(1 << 20):
+                        hasher.update(block)
+                        handle.write(block)
+        if "sha256:" + hasher.hexdigest() != expected:
+            raise CapsuleError("the capsule in the package does not match the package's own label")
+        return {"capsule_digest": expected, "image": package.digest, "agent_id": _labels(package.config).get(f"{oci.ANNOTATION_PREFIX}agent_id")}
+    finally:
+        package.close()
+
+
+def _runtime_of(package: Base) -> Base:
+    """The runtime image a package was built on: every layer but the capsule, the config without the agent."""
+    config = copy.deepcopy(package.config)
+    labels = _labels(config)
+    name, digest = labels.get("org.opencontainers.image.base.name", package.name), labels.get("org.opencontainers.image.base.digest", package.digest)
+    config["config"]["Labels"] = {k: v for k, v in labels.items() if k == RUNTIME_LABEL or not
+                                  (k.startswith(oci.ANNOTATION_PREFIX) or k.startswith("org.opencontainers.image.base."))}
+    config["rootfs"]["diff_ids"] = config["rootfs"]["diff_ids"][:-1]
+    config["history"] = (config.get("history") or [])[:-1]
+    return Base(name=name, digest=digest, config=config, layers=package.layers[:-1], open_blob=package.open_blob)
+
+
+def repack(path: Path, capsule_path: Path, ledger_url: str) -> dict:
+    """Rewrite the package file in place around a new capsule (what a host does after the agent ran). The
+    runtime layers come from the file itself, so nothing is downloaded; the file is replaced atomically."""
+    path = Path(path)
+    package = open_package(path)
+    try:
+        runtime = _runtime_of(package)
+        with tempfile.TemporaryDirectory(prefix=".singular-repack-", dir=path.parent) as work:
+            image = build(runtime, Path(capsule_path), ledger_url, Path(work), package=path.name)
+            result = write_archive(image, runtime, path, package.tag or "singular/agent:latest")
+    finally:
+        package.close()
+    return {**result, "capsule_digest": _labels(json.loads(image.config))[f"{oci.ANNOTATION_PREFIX}capsule_digest"]}
 
 
 def open_base(base: str, platform: str = DEFAULT_PLATFORM, *, credentials: bool = True) -> Base:
@@ -268,7 +353,9 @@ def _capsule_layer(capsule_path: Path, out: Path, mtime: int) -> dict:
             "annotations": {"org.opencontainers.image.title": "agent.sngcap"}}
 
 
-def build(base: Base, capsule_path: Path, ledger_url: str, workdir: Path) -> AgentImage:
+def build(base: Base, capsule_path: Path, ledger_url: str, workdir: Path, package: str | None = None) -> AgentImage:
+    """``package``: the file name of the one-file package this image is written as; a host that finds that
+    file under ``/package`` starts the agent from it and rewrites it after each run."""
     header = capsule.read_header(capsule_path)
     meta = header.get("meta") or {}
     if meta.get("for_sale", True):
@@ -288,7 +375,7 @@ def build(base: Base, capsule_path: Path, ledger_url: str, workdir: Path) -> Age
     inner = config.setdefault("config", {})
     env = [e for e in inner.get("Env") or [] if e.split("=", 1)[0] not in _OURS]
     inner["Env"] = env + [f"SINGULAR_CAPSULE={CAPSULE_IN_IMAGE}", f"SINGULAR_CAPSULE_DIGEST={capsule_digest}",
-                          f"SINGULAR_LEDGER={ledger_url}"]
+                          f"SINGULAR_LEDGER={ledger_url}"] + ([f"SINGULAR_PACKAGE={PACKAGE_DIR}/{package}"] if package else [])
     inner["Labels"] = {**(inner.get("Labels") or {}), **labels}
     created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
     config["created"] = created
@@ -415,7 +502,7 @@ def pack(capsule_path: Path, ledger_url: str, *, base: str | None = None, push_t
     opened = open_base(base, platform, credentials=same_registry)
     try:
         with tempfile.TemporaryDirectory(prefix="singular-pack-") as work:
-            image = build(opened, Path(capsule_path), ledger_url, Path(work))
+            image = build(opened, Path(capsule_path), ledger_url, Path(work), package=Path(out).name if out else None)
             if push_to:
                 result = push(image, opened, push_to)
                 where = result["image"]
@@ -425,7 +512,12 @@ def pack(capsule_path: Path, ledger_url: str, *, base: str | None = None, push_t
                 where = result["tag"]
     finally:
         opened.close()
-    run = ("docker run -d --name agent --read-only --tmpfs /tmp -v agent-home:/agent/home "
-           f"-e SINGULAR_PASSPHRASE -e SINGULAR_CAPSULE_PASSPHRASE -e OPENROUTER_API_KEY {where}")
+    if out:   # the one-file form: the file is the agent, and the host rewrites it after each run
+        run = (f'docker load -i {Path(out).name} && docker run -d --name agent --read-only --tmpfs /tmp '
+               f'--user "$(id -u):0" -v "$PWD:{PACKAGE_DIR}" '
+               f"-e SINGULAR_PASSPHRASE -e SINGULAR_CAPSULE_PASSPHRASE -e OPENROUTER_API_KEY {where}")
+    else:
+        run = ("docker run -d --name agent --read-only --tmpfs /tmp -v agent-home:/agent/home "
+               f"-e SINGULAR_PASSPHRASE -e SINGULAR_CAPSULE_PASSPHRASE -e OPENROUTER_API_KEY {where}")
     return {**result, "agent_id": image.meta.get("agent_id"), "base": opened.name, "base_digest": opened.digest,
             "ledger": ledger_url, "run": run}

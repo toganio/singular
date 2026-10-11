@@ -43,48 +43,59 @@ All settings are listed at the top of [`hosting.py`](../src/singular/hosting.py)
 `SINGULAR_REPORT_TOKEN` let a control plane follow state changes (`starting`, `running`, `stopped`, `failed`);
 the ledger stays the source of truth for whether the agent is running.
 
-## One agent, one image (`singular pack`)
+## One agent, one file (`singular pack`)
 
-The runtime image above holds no agent and pulls one on first start. `singular pack` makes the other kind: an
-image with the agent inside, which runs with nothing else installed and no capsule to fetch.
+The runtime image above holds no agent and pulls one on first start. `singular pack` makes the other kind: one
+file that holds everything, like a VM disk. Hermes, Singular and the agent (identity, memory, skills, history)
+are all inside, and the file is rewritten after every run, so it always holds the agent as it is now.
 
 ```bash
 singular export --move --out ada.capsule                       # stop the agent first
-singular pack ada.capsule --ledger https://ledger.example --push ghcr.io/you/ada:v1   # prints ghcr.io/you/ada@sha256:…
-singular pack ada.capsule --ledger https://ledger.example --out ada.tar --tag ada:v1  # or: one file
+singular pack ada.capsule --ledger https://ledger.example --out ada.tar --tag ada:v1
 ```
 
-Then, on any machine with Docker or Podman:
+Then, on any machine with Docker or Podman, from the folder holding `ada.tar`:
 
 ```bash
-docker load -i ada.tar                                         # only for the one-file form
-docker run -d --name ada --read-only --tmpfs /tmp -v ada-home:/agent/home \
+docker load -i ada.tar
+docker run -d --name ada --read-only --tmpfs /tmp --user "$(id -u):0" -v "$PWD:/package" \
   -e SINGULAR_PASSPHRASE -e SINGULAR_CAPSULE_PASSPHRASE -e OPENROUTER_API_KEY ada:v1
-docker run -it --read-only --tmpfs /tmp -v ada-home:/agent/home -e SINGULAR_PASSPHRASE -e OPENROUTER_API_KEY ada:v1 hermes   # a chat
+docker stop -t 120 ada                                          # seals, lets go, rewrites ada.tar
 ```
 
-`pack` adds one layer to the runtime image holding the capsule at `/opt/singular/agent.sngcap`, and sets
-`SINGULAR_CAPSULE`, `SINGULAR_CAPSULE_DIGEST` and `SINGULAR_LEDGER` in the image. It needs no Docker: it reads
-the base from a registry (default `ghcr.io/toganio/singular-runtime:<version>`, or a `docker save` archive
-with `--base`) and writes the new image with the registry API. The base digest is recorded in the image labels.
+What happens:
 
-What the box does and does not guarantee:
+1. **Start.** The agent comes out of `ada.tar` itself (the folder is mounted at `/package`), is opened with the
+   capsule passphrase and checked file by file against the ledger. Only the newest package starts: the ledger
+   records which one that is, and an older copy of the file is refused by name.
+2. **Run.** It takes the run lease; a second copy started anywhere is refused while it runs.
+3. **Stop.** It seals what it learned and lets go of the lease. Then it writes a new `ada.tar` around its new
+   state (the runtime layers are taken from the old file, nothing is downloaded), swaps it in atomically, and
+   records the new package on the ledger (`PACKAGE`: which capsule and image, signed with the agent's key).
+4. **Next start**, here or on any other machine with that file: back to step 1, from the new file. No volume
+   is needed and no `docker load` again: the image is only the engine, the agent comes from the file.
 
-- **Portable and tamper-evident.** The image is one artifact, pinned by digest; the capsule inside is encrypted,
-  and every file it unpacks must hash to what the ledger sealed.
-- **Nothing else writes into it.** Hermes, Singular and the capsule are image layers, fixed by the image digest
-  and owned by root; the agent runs as an unprivileged user. Run it with `--read-only` (as above) and the only
-  writable place is the agent's own home. Inside that home, every core file and the internal memory are sealed:
-  at each start the files are checked against the ledger before the agent runs, and a change that did not come
-  from a sealed run (another app, a person, a stray mount) stops the start.
-- **Never two at once** comes from the ledger, not the box. Any number of copies of the image can exist; the
-  run lease lets one run at a time, and a second copy started beside it is refused.
-- **Copies go stale.** Once the agent has run and sealed what it learned, the capsule baked in the image is
-  behind the ledger and no copy of the image can start a new agent from it. The living agent is the
-  `/agent/home` volume: always give it a named volume (`docker run --rm` would delete an anonymous one, and
-  with it what the agent learned). To move it again, `export --move` from that volume and `pack` again.
-- **Accountable.** The actions the agent takes are anchored on the ledger under its own key, wherever the
-  image runs.
+Give `docker stop` time to rewrite the file (`-t 120`). If a run is cut off before the rewrite, nothing is lost
+as long as the container still exists: `docker start ada` and stop it again.
+
+The same image can also be pushed to a registry (`--push ghcr.io/you/ada:v1`, pinned by the printed digest) and
+run with a named volume (`-v ada-home:/agent/home`) instead of a file; then the volume is the living agent.
+
+`pack` needs no Docker: it reads the runtime from a registry (default `ghcr.io/toganio/singular-runtime:<version>`,
+or a `docker save` archive with `--base`), adds one layer holding the capsule at `/opt/singular/agent.sngcap`, and
+records the runtime's digest in the image labels.
+
+What the file does and does not guarantee:
+
+- **One closed box.** Everything is in the file; the capsule inside is encrypted, and every file it unpacks must
+  hash to what the ledger sealed.
+- **Nothing else writes into it.** Hermes, Singular and the capsule are image layers owned by root; the agent runs
+  unprivileged with `--read-only`, so it can write only its own scratch home and its package folder. Every core
+  file and the internal memory are sealed: a change that did not come from a sealed run stops the next start.
+- **Never two at once** comes from the ledger, not the box: any number of copies of the file can exist, the run
+  lease lets one run at a time, and once a newer package is recorded every older copy is refused.
+- **Accountable.** The actions the agent takes are anchored on the ledger under its own key, and each package
+  records the action history it carries.
 
 ## Capsules in a registry
 
