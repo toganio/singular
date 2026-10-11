@@ -62,6 +62,12 @@ seller$ singular transfer approve  --file req.json --ledger https://…   # last
 buyer$  singular transfer finalize --home ~/agents/ada
 ```
 
+On a host that keeps the agent (the Singular site), nobody passes files: the buyer's browser makes the new agent
+key and signs, the seller signs last, and the host moves the files with
+`singular transfer handover --from <seller's home> --keystore <buyer's new agent key> --home <buyer's home>`.
+What it copies is exactly a for-sale capsule's contents (no seller key, no private history), checked against the
+ledger like an import, and only once the ledger names the buyer's key.
+
 A shared memory bank:
 
 ```bash

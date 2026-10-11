@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from . import capsule, tree
@@ -472,3 +473,24 @@ def transfer_finalize(agent_home: AgentHome, ledger: Ledger) -> None:
     if record["agent_pub"] != load_keystore(pending)["pub"]:
         raise SingularError("the ledger does not show this transfer yet")
     os.replace(pending, agent_home.keystore_path)
+
+
+def handover(source_home: AgentHome, target: Path, ledger: Ledger, new_keystore: dict) -> AgentHome:
+    """Hand a sold agent's files to its new owner on the same host, with no file passing between people.
+
+    Runs after the TRANSFER landed. ``new_keystore`` is the agent key the buyer made (and wrapped under their own
+    passphrase) when they asked to buy: the ledger must already name it. What reaches ``target`` is exactly what a
+    for-sale capsule carries, so the seller's old key and private action records stay behind, and it is checked
+    against the ledger the same way an import is. The source home is left as it was; the caller deletes it."""
+    record = require_agent(ledger, source_home.agent_id)
+    if new_keystore.get("kind") != "singular-keystore" or new_keystore.get("v") != 1 or new_keystore.get("label") != "agent":
+        raise SingularError("that is not an agent keystore")
+    if new_keystore.get("pub") != record["agent_pub"]:
+        raise SingularError("the ledger does not name this agent key; has the transfer landed?")
+    capsule_passphrase = os.urandom(24).hex()
+    with tempfile.TemporaryDirectory() as scratch:
+        packed = Path(scratch) / "handover.capsule"
+        export_capsule(source_home, ledger, packed, capsule_passphrase, for_sale=True)
+        bought = import_capsule(packed, Path(target), capsule_passphrase, ledger)
+    save_keystore(bought.keystore_path, new_keystore)
+    return bought
