@@ -324,6 +324,16 @@ class LedgerState:
         _short(body["reason"], "reason")
         self._next_seal(agent, body, now_ms, "owner_attest", _uint(body["files"], "files"), _uint(body["bytes"], "bytes"))
 
+    def _owner_policy(self, agent: dict, tx: dict, now_ms: int) -> None:
+        """The owner turns owner edits on or off. Public like every other transaction, so a buyer sees the policy
+        and, in the history, every owner-attested seal made under it."""
+        body = tx["body"]
+        T.require_fields(body, ["allow_owner_attest"])
+        if set(body) != {"allow_owner_attest"} or not isinstance(body["allow_owner_attest"], bool):
+            _reject("BAD_BODY", "body must be {allow_owner_attest: bool}")
+        self._require_owner_idle(agent, tx, now_ms)
+        agent["policy"] = {**agent["policy"], "allow_owner_attest": body["allow_owner_attest"]}
+
     # -- actions ---------------------------------------------------------------------------
 
     def _actions(self, agent: dict, tx: dict, now_ms: int) -> None:
@@ -461,7 +471,15 @@ class LedgerState:
         if _uint(body["key_gen"], "key_gen") != bank["key_gen"]:
             # The bank was re-keyed since this writer last looked: what it encrypted is unreadable to others.
             _reject("STALE_GRANT", f"bank key generation is {bank['key_gen']}")
-        if writer == OWNER_WRITER:
+        if writer == OWNER_WRITER and bank["mode"] == "internal":
+            # The owner edits the agent's own memory by hand: same rule as OWNER_ATTEST on the core.
+            agent = self.agents[bank["bound_agent"]]
+            if agent["status"] != "active":
+                _reject("AGENT_RETIRED", bank["bound_agent"])
+            self._require_owner_idle(agent, tx, now_ms)
+            if not agent["policy"]["allow_owner_attest"]:
+                _reject("POLICY_FORBIDS", "this agent's policy forbids owner edits")
+        elif writer == OWNER_WRITER:
             self._require_external_owner(bank, tx)
             if not bank["policy"]["allow_owner_write"]:
                 _reject("POLICY_FORBIDS", "this bank was created with owner writes forbidden")

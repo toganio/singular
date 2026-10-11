@@ -318,15 +318,41 @@ def rollback(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, root:
 
 
 def owner_attest(agent_home: AgentHome, ledger: Ledger, owner_key: SigningKey, reason: str) -> dict:
-    """Owner edits the core by hand and takes responsibility for it, *if* the agent's policy allows."""
+    """Owner edits the agent by hand and takes responsibility for it, *if* the agent's policy allows.
+    The core is re-sealed with ``OWNER_ATTEST``; the internal memory, when it changed too, with a ``BANK_SEAL``
+    written by ``owner``. Core first: if the memory seal is then refused, the core edit stands on its own."""
     record = require_agent(ledger, agent_home.agent_id)
-    entries = agent_home.scan_core()
-    s, seal = tree.summarize(entries), record["seal"]
-    receipt = submit(ledger, agent_home.identity["chain_id"], T.OWNER_ATTEST, record["id"], record["nonce"] + 1,
-                     {"seq": seal["seq"] + 1, "prev_root": seal["root"], "root": s["root"], "files": s["files"],
-                      "bytes": s["bytes"], "reason": reason}, {"owner": owner_key})
-    agent_home.snapshot("core", entries)
-    return receipt
+    bank = require_bank(ledger, record["memory_bank"])
+    core, memory = agent_home.scan_core(), agent_home.scan_memory()
+    c, m = tree.summarize(core), tree.summarize(memory)
+    chain_id, nonce, out = agent_home.identity["chain_id"], record["nonce"], {}
+    if c["root"] != record["seal"]["root"] or m["root"] == bank["seal"]["root"]:
+        seal = record["seal"]
+        out["core"] = submit(ledger, chain_id, T.OWNER_ATTEST, record["id"], nonce + 1,
+                             owner_attest_body(seal, c, reason), {"owner": owner_key})
+        agent_home.snapshot("core", core)
+    if m["root"] != bank["seal"]["root"]:
+        out["memory"] = submit(ledger, chain_id, T.BANK_SEAL, bank["id"], bank["nonce"] + 1,
+                               owner_memory_body(bank["seal"], m), {"owner": owner_key})
+        agent_home.snapshot("memory", memory)
+    return out
+
+
+def owner_attest_body(seal: dict, summary: dict, reason: str) -> dict:
+    return {"seq": seal["seq"] + 1, "prev_root": seal["root"], "root": summary["root"], "files": summary["files"],
+            "bytes": summary["bytes"], "reason": reason}
+
+
+def owner_memory_body(seal: dict, summary: dict) -> dict:
+    return {"writer": "owner", "key_gen": 0, "seq": seal["seq"] + 1, "prev_root": seal["root"], "root": summary["root"],
+            "files": summary["files"], "bytes": summary["bytes"]}
+
+
+def set_owner_edits(agent_id: str, ledger: Ledger, chain_id: str, owner_key: SigningKey, allow: bool) -> dict:
+    """Turn owner edits on or off for an agent you own (it must not be running). Recorded publicly."""
+    record = require_agent(ledger, agent_id)
+    return submit(ledger, chain_id, T.OWNER_POLICY, agent_id, record["nonce"] + 1, {"allow_owner_attest": allow},
+                  {"owner": owner_key})
 
 
 # -- proving ownership to a third party ---------------------------------------------------------
