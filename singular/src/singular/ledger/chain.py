@@ -177,18 +177,25 @@ class Chain:
         return [json.loads(r[0]) for r in rows]
 
     def history(self, subject: str, limit: int = 200) -> list[dict]:
-        """Every transaction that touched an agent or bank, oldest first: the audit trail."""
+        """The latest ``limit`` transactions that touched an agent or bank, oldest first: the audit trail."""
+        return self.history_page(subject, limit)[0]
+
+    def history_page(self, subject: str, limit: int = 200) -> tuple[list[dict], bool]:
+        """Like :meth:`history`, plus whether older transactions were left out. The *newest* are kept: an audit that
+        stops at the oldest 200 would never show what an agent did last."""
         limit = max(1, min(int(limit), 1000))
         with self._lock:
-            rows = self._db.execute("SELECT txid, height FROM txs WHERE subject = ? ORDER BY height LIMIT ?",
-                                    (subject, limit)).fetchall()
+            rows = self._db.execute("SELECT txid, height FROM txs WHERE subject = ? ORDER BY height DESC, rowid DESC LIMIT ?",
+                                    (subject, limit + 1)).fetchall()
+            truncated = len(rows) > limit
+            rows = rows[:limit][::-1]
             out = []
             for wanted, height in rows:
                 block = json.loads(self._db.execute("SELECT data FROM blocks WHERE height = ?", (height,)).fetchone()[0])
                 for t in block["txs"]:
                     if T.txid(t, self.chain_id) == wanted:
                         out.append({"txid": wanted, "height": height, "ts": block["header"]["ts"], "tx": t})
-        return out
+        return out, truncated
 
     # -- writing ---------------------------------------------------------------------------
 

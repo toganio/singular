@@ -186,6 +186,13 @@ class BankOwner:
         return receipt
 
     def rekey(self) -> dict:
+        # Grants voided by a sale or key rotation (epoch moved) are dropped first: wrapping the new key to the
+        # agent's *current* key would hand the bank to whoever holds the agent now.
+        for agent_id, grant in self._bank()["grants"].items():
+            agent = require_agent(self.ledger, agent_id)
+            if grant["epoch"] != agent["epoch"] or agent["status"] != "active":
+                submit(self.ledger, self.chain_id, T.BANK_REVOKE, self.bank_id, self._bank()["nonce"] + 1,
+                       {"agent": agent_id}, {"owner": self.key})
         bank, keys = self._bank(), self._owner_keys()
         old_gen, new_gen = bank["key_gen"], bank["key_gen"] + 1
         raw = self.store.get(_manifest_name(bank["seal"]["root"], old_gen))
@@ -415,8 +422,18 @@ class BankMount:
             _, bank, manifest, keys = self._pull()
             gen = bank["key_gen"]
             known = {e["h"]: e for e in manifest["entries"]}
+            local = self._scan()
+            if writer != OWNER_WRITER:
+                # Members write append-only, under their own name. The ledger cannot see paths (it holds one root), so a
+                # hostile client can still skip this; the old state then survives in the earlier manifest and the ledger
+                # names who sealed the erasing one. An honest client never erases another member's entries.
+                own = f"entries/{writer}/"
+                change = tree.diff(_public_entries(manifest["entries"]), local)
+                foreign = [p for p in change["added"] + change["changed"] + change["removed"] if not p.startswith(own)]
+                if foreign:
+                    raise SingularError(f"a bank member writes only under {own}; refusing to change {foreign[:3]}")
             entries = []
-            for entry in self._scan():
+            for entry in local:
                 if entry["h"] in known:
                     entries.append({**entry, "b": known[entry["h"]]["b"], "g": known[entry["h"]]["g"]})
                     continue

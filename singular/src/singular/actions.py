@@ -49,7 +49,7 @@ class ActionLog:
         if base.exists():
             data = json.loads(base.read_text(encoding="utf-8"))
             self.count, self.head = int(data["count"]), str(data["head"])
-        self.base_count = self.count
+        self.base_count, self.base_head = self.count, self.head
         if self.path.exists():
             for record in self.read():
                 self.count, self.head = record["n"], record_hash(record)
@@ -83,6 +83,14 @@ class ActionLog:
                 os.fsync(handle.fileno())
             self.count, self.head = record["n"], record_hash(record)
             return record
+
+    def head_at(self, n: int) -> str | None:
+        """The chain head after record ``n`` (None if this log does not reach it)."""
+        if n == self.count:
+            return self.head
+        if n == self.base_count:
+            return self.base_head
+        return next((record_hash(r) for r in self.read(n) if r["n"] == n), None) if n > self.base_count else None
 
     def batch(self, anchored_count: int) -> dict | None:
         """The ``ACTIONS`` transaction body for everything not yet on the ledger."""

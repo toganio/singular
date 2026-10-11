@@ -43,6 +43,7 @@ ANCHOR_EVERY = 20          # records between forced anchors
 ANCHOR_INTERVAL_S = 15.0   # and never leave records un-anchored longer than this while the ledger is reachable
 STALE_ACTION_S = 900.0     # an action that never reported back stops shielding drift checks after this long
 LEASE_SAFETY = 0.9         # act only during the first 90 % of a lease
+_RESYNC = ("NONCE_CONFLICT", "ACTION_GAP", "STALE_STATE")   # our view of the ledger is behind: re-read, don't give up
 
 
 def _now_ms() -> int:
@@ -80,6 +81,8 @@ class SingularGuard:
         self._deadline = 0.0
         self._ttl_s = 0.0
         self._open: dict[int, float] = {}
+        self._unsure = False                  # a submission's answer was lost: re-read the ledger before the next one
+        self._pending: dict[str, str] = {}    # roots of seals sent but not confirmed: the files may legitimately be there
 
     # -- properties ------------------------------------------------------------------------
 
@@ -192,10 +195,37 @@ class SingularGuard:
         if self.tamper_reason:
             raise SealError(self.tamper_reason + ". Stop it and run `singular restore`.")
 
+    def _resync(self) -> None:
+        """Adopt what the ledger holds after an answer was lost (or a submission was refused as stale). While our lease
+        is live nobody else can seal the core, write the internal memory or anchor actions, so any move the ledger
+        shows there must be one of ours that landed unseen; anything else means we lost the agent."""
+        record = require_agent(self.ledger, self.agent_id)
+        bank = require_bank(self.ledger, record["memory_bank"])
+        lease, count = record.get("lease"), record["actions"]["count"]
+        if not (lease and self._host_key and lease["host_pub"] == self._host_key.public_hex):
+            self.lost_reason = "the ledger no longer shows our run lease"
+        elif record["seal"]["root"] not in (self._core_root, self._pending.get("core")) or \
+                bank["seal"]["root"] not in (self._memory_root, self._pending.get("memory")):
+            self.lost_reason = "the ledger shows a seal this run did not make"
+        elif count < self._anchored or self.log.head_at(count) != record["actions"]["head"]:
+            self.lost_reason = "the ledger's action head is not this run's log"
+        if self.lost_reason:
+            raise LeaseError(f"run lease lost: {self.lost_reason}")
+        self._nonce, self._anchored = record["nonce"], count
+        self._core_root, self._core_seq = record["seal"]["root"], record["seal"]["seq"]
+        self._memory_root, self._memory_seq, self._bank_nonce = bank["seal"]["root"], bank["seal"]["seq"], bank["nonce"]
+        self._pending = {k: v for k, v in self._pending.items() if v != (self._core_root if k == "core" else self._memory_root)}
+        self._unsure = False
+
     def _submit_agent(self, tx_type: str, body: dict) -> dict:
+        if self._unsure:
+            self._resync()
         try:
             receipt = submit(self.ledger, self.chain_id, tx_type, self.agent_id, self._nonce + 1, body,
                              {"agent": self._agent_key, "host": self._host_key})
+        except LedgerUnavailable:
+            self._unsure = True  # it may have landed all the same
+            raise
         except LedgerRejected as exc:
             if exc.code == "NONCE_CONFLICT":
                 # The owner may have legitimately used a slot. Re-read; if the lease is still ours, retry once.
@@ -259,16 +289,20 @@ class SingularGuard:
         return len(self._open)
 
     def check_idle(self) -> None:
-        """With no action open, the files must be exactly the last sealed state."""
+        """With no action open, the files must be exactly the last sealed state, or the state of a seal this run sent
+        that the ledger has not confirmed yet (which is then retried: a lost answer is not tampering)."""
         with self._lock:
             self.check_untouched()
             if self._open_actions():
                 return
             _, core, _, memory = self._current()
-            if core["root"] != self._core_root or memory["root"] != self._memory_root:
-                what = "core files" if core["root"] != self._core_root else "internal memory"
+            core_ok = core["root"] in (self._core_root, self._pending.get("core"))
+            if not core_ok or memory["root"] not in (self._memory_root, self._pending.get("memory")):
+                what = "core files" if not core_ok else "internal memory"
                 self.tamper_reason = f"{what} changed while the agent was idle: someone else wrote to this agent"
                 self.check_untouched()
+            if core["root"] != self._core_root or memory["root"] != self._memory_root:
+                self.reseal("retry")  # still down: raises, and the next action waits; nothing is lost
 
     # -- what the agent does ---------------------------------------------------------------
 
@@ -307,32 +341,55 @@ class SingularGuard:
     def anchor_actions(self) -> dict | None:
         with self._lock:
             self.check()
-            body = self.log.batch(self._anchored)
-            if body is None:
-                return None
-            receipt = self._submit_agent(T.ACTIONS, body)
-            self._anchored = body["last"]
-            return receipt
+            for attempt in (0, 1):
+                if self._unsure:
+                    self._resync()
+                body = self.log.batch(self._anchored)
+                if body is None:
+                    return None
+                try:
+                    receipt = self._submit_agent(T.ACTIONS, body)
+                except LedgerRejected as exc:
+                    if attempt or exc.code not in _RESYNC or self.lost_reason:
+                        raise
+                    self._unsure = True  # an earlier anchor landed unseen: continue from where the ledger is
+                    continue
+                self._anchored = body["last"]
+                return receipt
+            return None
 
     def reseal(self, reason: str = "runtime") -> dict:
         """Seal what the agent changed in itself. Core and internal memory seal independently."""
         with self._lock:
             self.check_untouched()
+            if self._unsure:
+                self._resync()
             out: dict = {"core": None, "memory": None}
             core_entries, core, memory_entries, memory = self._current()
-            if core["root"] != self._core_root:
-                self.home.snapshot("core", core_entries)
-                out["core"] = self._submit_agent(T.SEAL, {
-                    "seq": self._core_seq + 1, "prev_root": self._core_root, "root": core["root"],
-                    "files": core["files"], "bytes": core["bytes"], "reason": reason[:64]})
-                self._core_root, self._core_seq = core["root"], self._core_seq + 1
-            if memory["root"] != self._memory_root:
-                self.home.snapshot("memory", memory_entries)
-                out["memory"] = submit(self.ledger, self.chain_id, T.BANK_SEAL, self.home.bank_id, self._bank_nonce + 1, {
-                    "writer": self.agent_id, "key_gen": 0, "seq": self._memory_seq + 1, "prev_root": self._memory_root,
-                    "root": memory["root"], "files": memory["files"], "bytes": memory["bytes"]},
-                    {"agent": self._agent_key, "host": self._host_key})
-                self._memory_root, self._memory_seq, self._bank_nonce = memory["root"], self._memory_seq + 1, self._bank_nonce + 1
+            try:
+                if core["root"] != self._core_root:
+                    self.home.snapshot("core", core_entries)
+                    self._pending["core"] = core["root"]
+                    out["core"] = self._submit_agent(T.SEAL, {
+                        "seq": self._core_seq + 1, "prev_root": self._core_root, "root": core["root"],
+                        "files": core["files"], "bytes": core["bytes"], "reason": reason[:64]})
+                    self._core_root, self._core_seq = core["root"], self._core_seq + 1
+                    del self._pending["core"]
+                if memory["root"] != self._memory_root:
+                    self.home.snapshot("memory", memory_entries)
+                    self._pending["memory"] = memory["root"]
+                    out["memory"] = submit(self.ledger, self.chain_id, T.BANK_SEAL, self.home.bank_id, self._bank_nonce + 1, {
+                        "writer": self.agent_id, "key_gen": 0, "seq": self._memory_seq + 1, "prev_root": self._memory_root,
+                        "root": memory["root"], "files": memory["files"], "bytes": memory["bytes"]},
+                        {"agent": self._agent_key, "host": self._host_key})
+                    self._memory_root, self._memory_seq, self._bank_nonce = memory["root"], self._memory_seq + 1, self._bank_nonce + 1
+                    del self._pending["memory"]
+            except LedgerUnavailable:
+                self._unsure = True
+                raise
+            except LedgerRejected as exc:
+                self._unsure = self._unsure or exc.code in _RESYNC
+                raise
             return out
 
     def signers(self) -> dict[str, SigningKey]:
@@ -356,9 +413,13 @@ class SingularGuard:
                 if not self.lost_reason:
                     try:
                         self.check_idle()
-                    except SealError:
-                        pass  # tampered: seal nothing, but still put the honest records on the ledger and let go
-                    self.anchor_actions()
+                    except SingularError:
+                        pass  # tampered, or a seal still cannot land: seal nothing more, but put the records on the ledger and let go
+                    try:
+                        self.anchor_actions()
+                    except SingularError:
+                        pass  # the records stay on disk; the next start anchors them before it acts
+                if not self.lost_reason:
                     self._submit_agent(T.LEASE_RELEASE, {})
                     self.check_ledger_history()  # remember the block that holds our release
             finally:

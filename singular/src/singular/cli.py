@@ -168,7 +168,11 @@ def cmd_transfer(args) -> int:
         _print({"request": args.file, "next": "send this file to the current owner"})
     elif args.step == "approve":
         request = json.loads(Path(args.file).read_text(encoding="utf-8"))
-        _print(A.transfer_approve(request, open_ledger(args.ledger), _owner_key(args)))
+        home = None if args.agent and args.ledger else _home(args)
+        agent_id, ledger = args.agent or home.agent_id, open_ledger(args.ledger) if args.ledger else _ledger_for(home, args)
+        name = A.require_agent(ledger, agent_id)["descriptor"]["name"]
+        receipt = A.transfer_approve(request, ledger, _owner_key(args), agent_id)
+        _print({"sold": agent_id, "name": name, "new_owner_pub": request["tx"]["body"].get("new_owner_pub"), "receipt": receipt})
     else:
         home = _home(args)
         A.transfer_finalize(home, _ledger_for(home, args))
@@ -306,6 +310,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p = add("transfer", cmd_transfer, "sell / hand over an agent", home=True, owner=True)
     p.add_argument("step", choices=["request", "approve", "finalize"])
     p.add_argument("--file", default="transfer-request.json")
+    p.add_argument("--agent", help="approve: id of the agent you mean to sell (default: the agent in --home)")
     p = add("owner", cmd_owner_action, "owner-only actions", home=True, owner=True)
     p.add_argument("action", choices=["revoke-lease", "rotate-key", "retire", "rollback", "attest"])
     p.add_argument("--root")
