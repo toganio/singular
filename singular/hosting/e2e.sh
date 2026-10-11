@@ -19,7 +19,7 @@ COMMAND="${E2E_COMMAND:-hermes gateway run}"
 cleanup() {
   docker rm -f "$RUN_ID-agent" "$RUN_ID-copy" "$RUN_ID-ledger" "$RUN_ID-registry" >/dev/null 2>&1 || true
   docker volume rm "$RUN_ID-home" "$RUN_ID-home-bo" "$RUN_ID-home-copy" "$RUN_ID-chain" >/dev/null 2>&1 || true
-  docker rmi "$RUN_ID-bo:v1" >/dev/null 2>&1 || true
+  docker rmi "$RUN_ID-bo:v1" "$RUN_ID-bo:v2" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -158,10 +158,40 @@ docker stop -t 120 "$RUN_ID-agent" >/dev/null
 docker logs "$RUN_ID-agent" 2>&1 | grep -q "singular-host: packaged" && [ "$(package_no)" = 2 ] && echo "ledger: package #2 recorded"
 docker rm -v "$RUN_ID-agent" >/dev/null
 
-step "the old copy of the file is refused"
+step "the owner exports and packs the agent again: the new file starts (same state, new digest)"
+docker save "$IMAGE" -o "$WORK/runtime.tar"
+chmod 644 "$WORK/runtime.tar"
+mkdir -p "$WORK/pkg2"
+docker run --rm --network "$NET" -v "$WORK:/work" --user "$(id -u):$(id -g)" -e HOME=/work "${export_env[@]}" \
+  -e SINGULAR_ALLOW_INSECURE_LEDGER=1 --entrypoint sh "$IMAGE" -c '
+    set -e
+    singular export --home /work/bo --move --out /work/bo2.capsule >/dev/null
+    singular pack /work/bo2.capsule --ledger http://ledger:8765 --base /work/runtime.tar --out /work/pkg2/bo.tar --tag "'"$RUN_ID"'-bo:v2" >/dev/null'
+rm -f "$WORK/runtime.tar" "$WORK/bo2.capsule"
+docker load -i "$WORK/pkg2/bo.tar" >/dev/null
+BO_IMAGE="$RUN_ID-bo:v2" start_bo "$RUN_ID-agent" "$WORK/pkg2"
+wait_log '"source": "package"'
+[ "$(lease)" = held ] && echo "ledger: the new file runs"
+docker stop -t 120 "$RUN_ID-agent" >/dev/null
+docker logs "$RUN_ID-agent" 2>&1 | grep -q "singular-host: packaged" && [ "$(package_no)" = 3 ] && echo "ledger: package #3 recorded"
+docker rm -v "$RUN_ID-agent" >/dev/null
+
+step "the agent learns something; the old copy of the file is now behind the ledger and refused"
+in_image python -c "from pathlib import Path
+from singular import agent as A
+from singular.ledger.client import HttpLedger
+from singular.runtime import SingularGuard
+home = A.AgentHome(Path('/work/bo'))
+guard = SingularGuard(home, HttpLedger('http://ledger:8765'), 'agent-pass-e2e')
+guard.start()
+intent = guard.begin_action('memory', {'path': 'memories/MEMORY.md'})
+(home.home / 'memories').mkdir(exist_ok=True)
+(home.home / 'memories' / 'MEMORY.md').write_text('- the client flies on Fridays\\n')
+guard.end_action(intent, 'memory', {'ok': True})
+guard.stop()"
 start_bo "$RUN_ID-copy" "$WORK/old"
 wait_for_exit "$RUN_ID-copy"
 docker logs "$RUN_ID-copy" 2>&1 | grep "old copy"
 [ "$(lease)" = free ] && echo "old copy refused; nothing runs"
 
-printf '\nPASS: pull, verify, run under the lease, release on stop, restart from the volume; a one-file agent runs alone, rewrites its file on stop, comes back from it, and old copies are refused\n'
+printf '\nPASS: pull, verify, run under the lease, release on stop, restart from the volume; a one-file agent runs alone, rewrites its file on stop, comes back from it, a re-packed file starts, and old copies are refused\n'

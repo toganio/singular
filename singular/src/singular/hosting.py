@@ -47,7 +47,7 @@ from pathlib import Path
 
 from . import agent as A
 from .cli import _enable_hermes_plugin, run_guarded
-from .errors import CapsuleError, SingularError
+from .errors import CapsuleError, SealError, SingularError
 from .ledger.client import open_ledger
 from .runtime import SingularGuard
 
@@ -158,15 +158,35 @@ def fetch_capsule(source: str, out: Path, expect_digest: str | None = None) -> d
     return {**info, "capsule_digest": file_digest}
 
 
-def _check_newest_package(ledger, capsule_path: Path, capsule_digest: str) -> None:
-    """A package (or an image baked from one) is only good while it is the newest the ledger knows."""
+def _newer_package(ledger, capsule_path: Path, capsule_digest: str) -> dict | None:
+    """The ledger's package record when it names a different capsule than this one, else None.
+
+    A different capsule is not by itself an old copy: after a sale, or after the owner exports and packs the
+    agent again, the new file carries the same sealed state under a new digest. What makes a copy old is a
+    state the ledger has moved past, which :func:`_refuse_old_copy` and the import check decide."""
     from .capsule import read_header
     agent_id = read_header(capsule_path)["meta"].get("agent_id")
     record = ledger.get_agent(agent_id) if agent_id else None
     package = (record or {}).get("package")
     if package and package["capsule"] != capsule_digest.removeprefix("sha256:"):
-        raise SingularError(f"this is an old copy of agent {agent_id}: package #{package['no']} is newer; "
-                            "start the agent from its newest package file")
+        return {**package, "agent_id": agent_id, "record": record}
+    return None
+
+
+def _old_copy(newer: dict) -> SingularError:
+    return SingularError(f"this is an old copy of agent {newer['agent_id']}: package #{newer['no']} is newer; "
+                         "start the agent from its newest package file")
+
+
+def _refuse_old_copy(ledger, capsule_path: Path, newer: dict | None) -> None:
+    """Refuse by name, before anything is unpacked, a package whose sealed roots the ledger has moved past."""
+    if not newer:
+        return
+    from .capsule import read_header
+    meta, record = read_header(capsule_path)["meta"], newer["record"]
+    memory_root = A.require_bank(ledger, record["memory_bank"])["seal"]["root"]
+    if (meta.get("core_root"), meta.get("memory_root")) != (record["seal"]["root"], memory_root):
+        raise _old_copy(newer)
 
 
 def prepare_home(home_path: Path, ledger_url: str, env: dict[str, str]) -> tuple[A.AgentHome, dict]:
@@ -197,8 +217,10 @@ def prepare_home(home_path: Path, ledger_url: str, env: dict[str, str]) -> tuple
             fetched = {"source": "package", "capsule_digest": extracted["capsule_digest"], "image": extracted["image"]}
         else:
             fetched = fetch_capsule(source, capsule_path, env.get("SINGULAR_CAPSULE_DIGEST"))
+        newer = None
         if package or source == CAPSULE_IN_IMAGE:
-            _check_newest_package(ledger, capsule_path, fetched["capsule_digest"])
+            newer = _newer_package(ledger, capsule_path, fetched["capsule_digest"])
+            _refuse_old_copy(ledger, capsule_path, newer)
         from .capsule import read_header
         if read_header(capsule_path)["meta"].get("for_sale", True):
             raise SingularError("this capsule was made for a sale (it carries no agent key) and cannot run; "
@@ -206,7 +228,12 @@ def prepare_home(home_path: Path, ledger_url: str, env: dict[str, str]) -> tuple
         # unpack inside the volume (same filesystem), then move the verified files up: the volume root itself
         # cannot be renamed, and import_capsule wants a fresh folder
         staging = home_path / ".singular-import"
-        A.import_capsule(capsule_path, staging, passphrase, ledger)
+        try:
+            A.import_capsule(capsule_path, staging, passphrase, ledger)
+        except SealError as exc:   # same roots, but the action history moved on after this copy was made
+            if newer:
+                raise _old_copy(newer) from exc
+            raise
     for child in list(staging.iterdir()):
         os.replace(child, home_path / child.name)
     staging.rmdir()

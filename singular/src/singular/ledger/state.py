@@ -355,8 +355,9 @@ class LedgerState:
         if _hash(body["memory_root"], "memory_root") != self.banks[agent["memory_bank"]]["seal"]["root"]:
             _reject("STALE_STATE", "buyer must accept exactly the latest sealed internal memory")
         # The epoch bump is what silently voids every external bank grant this agent held.
+        # The seller's package file is not the buyer's: the buyer's first package starts the count again.
         agent.update(owner_pub=new_owner, agent_pub=new_agent, enc_pub=_pub(body["new_enc_pub"], "new_enc_pub"), lease=None,
-                     epoch=agent["epoch"] + 1, transfers=agent["transfers"] + 1)
+                     epoch=agent["epoch"] + 1, transfers=agent["transfers"] + 1, package=None)
 
     def _rotate_key(self, agent: dict, tx: dict, now_ms: int) -> None:
         """The agent key leaked (or might have): the owner replaces it without selling. Works even while a

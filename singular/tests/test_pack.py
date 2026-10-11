@@ -233,6 +233,49 @@ def test_the_package_file_carries_the_living_agent(world, tmp_path):
         hosting.prepare_home(tmp_path / "vol3", node.url, {**env, "SINGULAR_PACKAGE": str(old_copy)})
 
 
+def test_a_new_package_of_the_current_state_starts(world, tmp_path):
+    """Exporting and packing the agent again (a re-move, or after a sale) makes a file with a new digest but
+    the current state: it starts. A copy whose state the ledger has moved past is still refused."""
+    _, node, ledger, agent, registry = world
+    out = _package(world, tmp_path)
+    old_copy = tmp_path / "old-ada.tar"
+    old_copy.write_bytes(out.read_bytes())
+    from conftest import PASS
+    env = {"SINGULAR_PACKAGE": str(out), "SINGULAR_CAPSULE": pack.CAPSULE_IN_IMAGE,
+           "SINGULAR_CAPSULE_PASSPHRASE": CAPSULE_PASS, "SINGULAR_PASSPHRASE": PASS}
+    home, _ = hosting.prepare_home(tmp_path / "vol1", node.url, env)
+    _run_once(home, ledger, "- learned that the client is in Ankara\n")
+    assert hosting.repack_package(home, node.url, env, lambda *a, **f: None)["no"] == 1
+
+    again = tmp_path / "pkg2" / "ada.tar"
+    again.parent.mkdir()
+    pack.pack(export(home, ledger, tmp_path / "again.capsule"), node.url, base=fake_runtime(registry), out=again, tag="ada:v2")
+    assert pack.package_info(again)["capsule_digest"].removeprefix("sha256:") != \
+        ledger.get_agent(agent.agent_id)["package"]["capsule"]
+    home2, how = hosting.prepare_home(tmp_path / "vol2", node.url, {**env, "SINGULAR_PACKAGE": str(again)})
+    assert how["source"] == "package" and "Ankara" in (home2.home / "memories" / "MEMORY.md").read_text()
+    with pytest.raises(SingularError, match="old copy"):
+        hosting.prepare_home(tmp_path / "vol3", node.url, {**env, "SINGULAR_PACKAGE": str(old_copy)})
+
+
+def test_a_sale_clears_the_package_record(agent, ledger, chain, owner):
+    from singular import agent as A
+    from singular.keys import SigningKey
+    from singular.ledger import tx as T
+    from conftest import PASS
+    A.record_package(agent, ledger, agent.unlock(PASS), "sha256:" + "1" * 64, "sha256:" + "2" * 64)
+    record = ledger.get_agent(agent.agent_id)
+    assert record["package"]["no"] == 1
+    buyer, new_agent = SigningKey.generate(), SigningKey.generate()
+    txn = T.build(T.TRANSFER, agent.agent_id, record["nonce"] + 1, {
+        "new_owner_pub": buyer.public_hex, "new_agent_pub": new_agent.public_hex, "new_enc_pub": new_agent.enc_public_hex,
+        "root": record["seal"]["root"], "memory_root": ledger.get_bank(record["memory_bank"])["seal"]["root"]})
+    for role, key in (("owner", owner), ("new_owner", buyer), ("new_agent", new_agent)):
+        T.sign(txn, chain.chain_id, role, key)
+    ledger.submit(txn)
+    assert ledger.get_agent(agent.agent_id)["package"] is None     # the seller's file is not the buyer's
+
+
 def test_package_records_follow_the_ledger_rules(world, tmp_path):
     from singular.keys import SigningKey
     from singular.ledger import tx as T

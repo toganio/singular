@@ -66,8 +66,9 @@ docker stop -t 120 ada                                          # seals, lets go
 What happens:
 
 1. **Start.** The agent comes out of `ada.tar` itself (the folder is mounted at `/package`), is opened with the
-   capsule passphrase and checked file by file against the ledger. Only the newest package starts: the ledger
-   records which one that is, and an older copy of the file is refused by name.
+   capsule passphrase and checked file by file against the ledger. Only a package holding the current state
+   starts: once the agent has moved on, an older copy of the file is refused by name. Exporting and packing the
+   agent again (or a sale) makes a new file of the same state, and that one starts.
 2. **Run.** It takes the run lease; a second copy started anywhere is refused while it runs.
 3. **Stop.** It seals what it learned and lets go of the lease. Then it writes a new `ada.tar` around its new
    state (the runtime layers are taken from the old file, nothing is downloaded), swaps it in atomically, and
@@ -93,7 +94,7 @@ What the file does and does not guarantee:
   unprivileged with `--read-only`, so it can write only its own scratch home and its package folder. Every core
   file and the internal memory are sealed: a change that did not come from a sealed run stops the next start.
 - **Never two at once** comes from the ledger, not the box: any number of copies of the file can exist, the run
-  lease lets one run at a time, and once a newer package is recorded every older copy is refused.
+  lease lets one run at a time, and every copy the agent has moved past is refused.
 - **Accountable.** The actions the agent takes are anchored on the ledger under its own key, and each package
   records the action history it carries.
 
