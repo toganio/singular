@@ -9,7 +9,7 @@
 #
 # Hermes is installed the way its own Dockerfile does it: locked dependencies (`uv sync --frozen`), then an
 # editable link to the source at this commit (Hermes refuses to be built as a wheel).
-FROM python:3.11-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
