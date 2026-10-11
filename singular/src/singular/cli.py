@@ -82,9 +82,12 @@ def _enable_hermes_plugin(home: Path) -> None:
     """Hermes plugins are opt-in per profile: add ``singular`` to ``plugins.enabled``."""
     config = home / "config.yaml"
     try:
-        import yaml  # Hermes depends on PyYAML; absent means this is not a Hermes install
+        import hermes_yaml as yaml  # Hermes' own YAML policy (ruamel) since v0.21
     except ImportError:
-        return
+        try:
+            import yaml  # older Hermes depended on PyYAML; neither means this is not a Hermes install
+        except ImportError:
+            return
     data = {}
     if config.exists():
         data = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
