@@ -118,9 +118,9 @@ AGENT_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["age
 docker load -i "$WORK/bo.tar"
 BO_IMAGE="$RUN_ID-bo:v1"
 
-step "run it: only a volume and the agent's passphrases, no capsule source, no ledger setting"
-start_bo() {  # name, volume
-  docker run -d --name "$1" --network "$NET" -v "$2:/agent/home" -e SINGULAR_PASSPHRASE=agent-pass-e2e \
+step "run it read-only: only a volume and the agent's passphrases, no capsule source, no ledger setting"
+start_bo() {  # name, volume; read-only root filesystem: the agent can write only its own home
+  docker run -d --name "$1" --network "$NET" --read-only --tmpfs /tmp -v "$2:/agent/home" -e SINGULAR_PASSPHRASE=agent-pass-e2e \
     -e SINGULAR_CAPSULE_PASSPHRASE=capsule-pass-e2e -e SINGULAR_ALLOW_INSECURE_LEDGER=1 "$BO_IMAGE" $COMMAND >/dev/null
 }
 start_bo "$RUN_ID-agent" "$RUN_ID-home-bo"

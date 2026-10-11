@@ -58,9 +58,9 @@ Then, on any machine with Docker or Podman:
 
 ```bash
 docker load -i ada.tar                                         # only for the one-file form
-docker run -d --name ada -v ada-home:/agent/home \
+docker run -d --name ada --read-only --tmpfs /tmp -v ada-home:/agent/home \
   -e SINGULAR_PASSPHRASE -e SINGULAR_CAPSULE_PASSPHRASE -e OPENROUTER_API_KEY ada:v1
-docker run -it -v ada-home:/agent/home -e SINGULAR_PASSPHRASE -e OPENROUTER_API_KEY ada:v1 hermes   # a chat instead
+docker run -it --read-only --tmpfs /tmp -v ada-home:/agent/home -e SINGULAR_PASSPHRASE -e OPENROUTER_API_KEY ada:v1 hermes   # a chat
 ```
 
 `pack` adds one layer to the runtime image holding the capsule at `/opt/singular/agent.sngcap`, and sets
@@ -72,6 +72,11 @@ What the box does and does not guarantee:
 
 - **Portable and tamper-evident.** The image is one artifact, pinned by digest; the capsule inside is encrypted,
   and every file it unpacks must hash to what the ledger sealed.
+- **Nothing else writes into it.** Hermes, Singular and the capsule are image layers, fixed by the image digest
+  and owned by root; the agent runs as an unprivileged user. Run it with `--read-only` (as above) and the only
+  writable place is the agent's own home. Inside that home, every core file and the internal memory are sealed:
+  at each start the files are checked against the ledger before the agent runs, and a change that did not come
+  from a sealed run (another app, a person, a stray mount) stops the start.
 - **Never two at once** comes from the ledger, not the box. Any number of copies of the image can exist; the
   run lease lets one run at a time, and a second copy started beside it is refused.
 - **Copies go stale.** Once the agent has run and sealed what it learned, the capsule baked in the image is

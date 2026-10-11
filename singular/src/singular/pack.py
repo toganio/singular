@@ -425,7 +425,7 @@ def pack(capsule_path: Path, ledger_url: str, *, base: str | None = None, push_t
                 where = result["tag"]
     finally:
         opened.close()
-    run = ("docker run -d --name agent -v agent-home:/agent/home "
+    run = ("docker run -d --name agent --read-only --tmpfs /tmp -v agent-home:/agent/home "
            f"-e SINGULAR_PASSPHRASE -e SINGULAR_CAPSULE_PASSPHRASE -e OPENROUTER_API_KEY {where}")
     return {**result, "agent_id": image.meta.get("agent_id"), "base": opened.name, "base_digest": opened.digest,
             "ledger": ledger_url, "run": run}
