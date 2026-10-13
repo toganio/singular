@@ -35,9 +35,10 @@ RUN uv pip install --no-deps -e . \
     && singular --version
 
 # Group 0 owns the agent's folders, so the image also runs as any uid in group 0 (`--user "$(id -u):0"`):
-# that is how a host lets the agent rewrite its package file in a folder the host user owns.
+# that is how a host lets the agent rewrite its package file in a folder the host user owns. /package is that
+# folder; made here so a named volume mounted on it starts out writable by the agent too.
 RUN useradd --uid 10001 --gid 0 --create-home --home-dir /agent --shell /usr/sbin/nologin agent \
-    && mkdir -p /agent/home && chown -R 10001:0 /agent && chmod -R g=u /agent
+    && mkdir -p /agent/home /package && chown -R 10001:0 /agent /package && chmod -R g=u /agent /package
 USER 10001:0
 WORKDIR /agent
 VOLUME ["/agent/home"]

@@ -8,6 +8,7 @@ import contextlib
 import getpass
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -263,8 +264,33 @@ def cmd_transfer(args) -> int:
             raise SingularError(f"{source.home} is not a Singular agent")
         target = args.home or os.environ.get("SINGULAR_HOME") or os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
         ledger = open_ledger(args.ledger or os.environ.get("SINGULAR_LEDGER") or source.identity["ledger_url"])
-        bought = A.handover(source, Path(target), ledger, json.loads(Path(args.keystore).read_text(encoding="utf-8")))
-        _print({"agent_id": bought.agent_id, "home": str(bought.home), "handed_over": True})
+        keystore = json.loads(Path(args.keystore).read_text(encoding="utf-8"))
+        if args.package:   # the one-file form: the buyer's agent leaves this step as its own package, recorded on the ledger
+            from . import hosting
+            if not args.base:
+                raise SingularError("--package needs --base, the runtime image to build the package on")
+            env = dict(os.environ)
+            env.update(hosting.load_secrets(Path(env.get("SINGULAR_SECRETS_FILE", hosting.DEFAULT_SECRETS)))[0])
+            hosting.check_bought_secrets(env, keystore)   # a wrong or missing passphrase stops before anything moves
+            target_path, package = Path(target), Path(args.package)
+            fresh = not target_path.exists() or not any(target_path.iterdir())
+            had_package = package.exists()
+        bought = A.handover(source, Path(target), ledger, keystore)
+        out = {"agent_id": bought.agent_id, "home": str(bought.home), "handed_over": True}
+        if args.package:
+            ledger_url = args.ledger or os.environ.get("SINGULAR_LEDGER") or source.identity["ledger_url"]
+            try:
+                info = hosting.package_bought(bought, ledger_url, package, args.base, env, args.platform)
+            except BaseException:
+                # all or nothing: undo the delivered home (and a half-made package) so the same command can be run again
+                if fresh:
+                    for child in list(target_path.iterdir()) if target_path.exists() else []:
+                        shutil.rmtree(child) if child.is_dir() and not child.is_symlink() else child.unlink()
+                if not had_package and package.exists():
+                    package.unlink()
+                raise
+            out["package"] = {k: v for k, v in info.items() if k != "receipt"}
+        _print(out)
     else:
         home = _home(args)
         A.transfer_finalize(home, _ledger_for(home, args))
@@ -424,6 +450,10 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p.add_argument("--agent", help="approve: id of the agent you mean to sell (default: the agent in --home)")
     p.add_argument("--from", dest="source", help="handover: the sold agent's home on this host (left untouched)")
     p.add_argument("--keystore", help="handover: the new agent key the buyer made; --home receives the agent")
+    p.add_argument("--package", help="handover: also write the buyer's agent as a one-file package here and record it "
+                   "(signed with the new agent key: SINGULAR_PASSPHRASE; encrypted with SINGULAR_CAPSULE_PASSPHRASE)")
+    p.add_argument("--base", help="handover --package: the runtime image to build on (registry reference or `docker save` archive)")
+    p.add_argument("--platform", default=None, help="handover --package: which platform of a multi-platform base (default linux/amd64)")
     p = add("owner", cmd_owner_action, "owner-only actions", home=True, owner=True)
     p.add_argument("action", choices=["revoke-lease", "rotate-key", "retire", "rollback", "attest", "allow-edits", "forbid-edits"])
     p.add_argument("--root")
