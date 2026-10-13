@@ -57,13 +57,14 @@ of signer roles below must be present, no more, no fewer. "now" is the enclosing
 | `TRANSFER` | owner, new_owner, new_agent (the seller's client signs only for the agent id the seller names) | no live lease; buyer names current `root` + `memory_root` | owner/agent/enc keys replaced, `epoch+1` (voids bank grants) |
 | `ROLLBACK` | owner | no live lease; target root was sealed before; body `{seq, prev_root, root, files, bytes}` (files/bytes of the target; bodies without them, from before v0.3, keep the current counts) | new seal, kind `rollback` |
 | `OWNER_ATTEST` | owner | no live lease; policy `allow_owner_attest` | new seal, kind `owner_attest` |
+| `OWNER_POLICY` | owner | no live lease; body exactly `{allow_owner_attest: bool}` | policy's `allow_owner_attest` set (since v0.4; earlier agents could only choose it at `REGISTER`) |
 | `ROTATE_KEY` | owner, new_agent | new key is fresh (works even while a lease is held: the holder may be the thief) | agent/enc keys replaced, lease dropped, `epoch+1`, `rotations+1` |
 | `RETIRE` | owner | — | agent frozen forever |
 | `BANK_CREATE` | owner | id matches; nonce 1 | external bank, key_gen 1 |
 | `BANK_GRANT` | bank owner | external; agent active; `key_gen` current | grant `{rights r\|rw, epoch, key_gen, wrapped_key, expires}` |
 | `BANK_REVOKE` | bank owner | grant exists | grant removed |
 | `BANK_REKEY` | bank owner | `key_gen+1`; wraps cover exactly the current grants | new key generation; each grant keeps its epoch (a grant voided by a sale stays void; clients revoke such grants first) |
-| `BANK_SEAL` | agent+host(lease) of `writer`, or bank owner if `writer="owner"` and policy allows | writer's lease live and grant valid (rights rw, epoch current, key_gen current, not expired) — internal bank: writer is the bound agent; `key_gen` current; `seq+1`; `prev_root` matches | new bank root, attributed to `writer` |
+| `BANK_SEAL` | agent+host(lease) of `writer`, or bank owner if `writer="owner"` and policy allows (internal bank: the agent's owner, agent not leased, agent policy `allow_owner_attest`) | writer's lease live and grant valid (rights rw, epoch current, key_gen current, not expired) — internal bank: writer is the bound agent; `key_gen` current; `seq+1`; `prev_root` matches | new bank root, attributed to `writer` |
 | `BANK_TRANSFER` | owner, new_owner | external | owner replaced |
 
 Rejection codes are stable strings (`LEASE_HELD`, `STALE_STATE`, `NONCE_CONFLICT`, `BAD_SIGNATURE`, `NO_GRANT`, …).
@@ -118,6 +119,15 @@ records only when moving your own agent). Import always ends with a full verific
 history in the capsule (records or `actions.base.json`) to end at the ledger's anchored count and head, and rewrites `ledger_url` to
 the importer's ledger. Unpack limits: 100 000 members, 16 GiB, 64 KiB per pax / GNU long-name header; links are validated with every
 link in place.
+
+## 8a. Owner edits from elsewhere (`singular unlock`)
+
+A host that keeps a *stopped* agent can apply edits the owner sealed somewhere else, without the owner key ever
+reaching it. `describe` prints the sealed entries (and the text of files up to 256 KiB). The owner's client applies
+its edits to those entries, computes the core and memory roots per §3, and signs an `OWNER_ATTEST` and/or an owner
+`BANK_SEAL`. `apply` writes the edits (never through a symlink, never outside the sealed sets or under `.singular/`),
+re-scans, and submits the signed seals only if their bodies equal the seals the edited files produce; otherwise, or if
+the ledger refuses the core seal, every file is put back. A refused memory seal puts back the memory edits only.
 
 ## 9. Node (reference HTTP front)
 
