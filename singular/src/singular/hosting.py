@@ -263,7 +263,17 @@ def repack_package(home: A.AgentHome, ledger_url: str, env: dict[str, str], repo
     return info
 
 
-def package_bought(home: A.AgentHome, ledger_url: str, package: Path, base: str, env: dict[str, str]) -> dict:
+def check_bought_secrets(env: dict[str, str], keystore: dict) -> None:
+    """Before a packaged handover moves anything: both passphrases are there, and the agent one opens the new key."""
+    for key in ("SINGULAR_PASSPHRASE", "SINGULAR_CAPSULE_PASSPHRASE"):
+        if not env.get(key):
+            raise SingularError(f"{key} is needed to package the bought agent")
+    from .keys import unwrap_key
+    unwrap_key(keystore, env["SINGULAR_PASSPHRASE"])
+
+
+def package_bought(home: A.AgentHome, ledger_url: str, package: Path, base: str, env: dict[str, str],
+                   platform: str | None = None) -> dict:
     """After ``transfer handover`` on a host: make the bought agent's one-file package and record it (``PACKAGE``).
 
     The buyer's new agent key signs, so the package is theirs from its first version; from then on the supervisor
@@ -281,7 +291,7 @@ def package_bought(home: A.AgentHome, ledger_url: str, package: Path, base: str,
         capsule_path = Path(tmp) / "agent.capsule"
         A.export_capsule(home, ledger, capsule_path, env["SINGULAR_CAPSULE_PASSPHRASE"], for_sale=False)
         capsule_digest = "sha256:" + hashlib.sha256(capsule_path.read_bytes()).hexdigest()
-        result = pack.pack(capsule_path, ledger_url, base=base, out=package)
+        result = pack.pack(capsule_path, ledger_url, base=base, out=package, platform=platform or pack.DEFAULT_PLATFORM)
     receipt = A.record_package(home, ledger, agent_key, capsule_digest, result["manifest_digest"])
     record = ledger.get_agent(home.agent_id) or {}
     return {"package": str(package), "no": (record.get("package") or {}).get("no"), "image": result["manifest_digest"],

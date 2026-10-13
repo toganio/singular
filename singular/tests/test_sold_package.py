@@ -75,18 +75,43 @@ def test_a_wrong_agent_passphrase_stops_before_anything_is_built(sold):
     assert not out.exists() and not ledger.get_agent(agent.agent_id).get("package")
 
 
-def test_cli_handover_with_package(sold):
-    tmp_path, node, ledger, agent, keystore, base = sold
+def _cli(tmp_path, node, agent, keystore, base, secrets_text):
     (tmp_path / "agent.keystore.json").write_text(json.dumps(keystore))
     secrets = tmp_path / "singular.env"
-    secrets.write_text(f"SINGULAR_PASSPHRASE={BUYER_PASS}\nSINGULAR_CAPSULE_PASSPHRASE={CAPSULE_PASS}\n")
-    run = subprocess.run(
+    secrets.write_text(secrets_text)
+    return subprocess.run(
         [sys.executable, "-c", "import sys; from singular.cli import main; sys.exit(main())", "transfer", "handover",
          "--from", str(agent.home), "--keystore", str(tmp_path / "agent.keystore.json"), "--home", str(tmp_path / "buyer"),
          "--ledger", node.url, "--package", str(tmp_path / "package" / "agent.tar"), "--base", base],
         capture_output=True, text=True, env={"PYTHONPATH": SRC, "SINGULAR_SECRETS_FILE": str(secrets),
                                              "SINGULAR_ALLOW_INSECURE_LEDGER": "1", "PATH": "/usr/bin:/bin"})
+
+
+SECRETS = f"SINGULAR_PASSPHRASE={BUYER_PASS}\nSINGULAR_CAPSULE_PASSPHRASE={CAPSULE_PASS}\n"
+
+
+def test_cli_handover_with_package(sold):
+    tmp_path, node, ledger, agent, keystore, base = sold
+    run = _cli(tmp_path, node, agent, keystore, base, SECRETS)
     assert run.returncode == 0, run.stderr
     said = json.loads(run.stdout)
     assert said["handed_over"] and said["package"]["no"] == 1
     assert said["package"]["capsule_digest"] == pack.package_info(tmp_path / "package" / "agent.tar")["capsule_digest"]
+
+
+def test_cli_packaged_handover_is_all_or_nothing(sold):
+    """A wrong passphrase moves nothing; a packaging failure after the copy undoes it, so the same command can rerun."""
+    tmp_path, node, ledger, agent, keystore, base = sold
+    wrong = _cli(tmp_path, node, agent, keystore, base, f"SINGULAR_PASSPHRASE=not the buyer's\nSINGULAR_CAPSULE_PASSPHRASE={CAPSULE_PASS}\n")
+    assert wrong.returncode != 0 and "wrong passphrase" in wrong.stderr
+    assert not (tmp_path / "buyer").exists()
+
+    (tmp_path / "buyer").mkdir()   # a host's mounted, empty volume
+    broken = _cli(tmp_path, node, agent, keystore, str(tmp_path / "no-such-base.tar"), SECRETS)
+    assert broken.returncode != 0
+    assert list((tmp_path / "buyer").iterdir()) == [] and not (tmp_path / "package" / "agent.tar").exists()
+    assert not ledger.get_agent(agent.agent_id).get("package")
+
+    again = _cli(tmp_path, node, agent, keystore, base, SECRETS)
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["package"]["no"] == 1
