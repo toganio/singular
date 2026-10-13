@@ -9,7 +9,7 @@
 #
 # Hermes is installed the way its own Dockerfile does it: locked dependencies (`uv sync --frozen`), then an
 # editable link to the source at this commit (Hermes refuses to be built as a wheel).
-FROM python:3.11-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -34,13 +34,18 @@ RUN uv pip install --no-deps -e . \
     && uv pip install -e ./singular \
     && singular --version
 
-RUN useradd --uid 10001 --create-home --home-dir /agent --shell /usr/sbin/nologin agent \
-    && mkdir -p /agent/home && chown -R agent:agent /agent
-USER agent
+# Group 0 owns the agent's folders, so the image also runs as any uid in group 0 (`--user "$(id -u):0"`):
+# that is how a host lets the agent rewrite its package file in a folder the host user owns.
+RUN useradd --uid 10001 --gid 0 --create-home --home-dir /agent --shell /usr/sbin/nologin agent \
+    && mkdir -p /agent/home && chown -R 10001:0 /agent && chmod -R g=u /agent
+USER 10001:0
 WORKDIR /agent
 VOLUME ["/agent/home"]
 
+# `singular pack` builds agent images on this one and refuses any base without this label.
+LABEL dev.singular.runtime="1"
 ENV SINGULAR_HOME=/agent/home \
-    HERMES_HOME=/agent/home
+    HERMES_HOME=/agent/home \
+    HOME=/agent
 
 ENTRYPOINT ["/usr/bin/tini", "--", "singular", "host"]

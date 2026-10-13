@@ -14,7 +14,10 @@ if os.environ.get("SINGULAR_REQUIRE_HERMES"):
     import hermes_cli.plugins as plugins  # CI: a silent skip here would be a fake green
 else:
     plugins = pytest.importorskip("hermes_cli.plugins", reason="Hermes Agent is not importable here")
-yaml = pytest.importorskip("yaml")
+try:
+    import hermes_yaml as yaml  # Hermes v0.21+ reads its config through this, not PyYAML
+except ImportError:
+    yaml = pytest.importorskip("yaml")
 
 from conftest import PASS, make_home  # noqa: E402
 from singular import agent as A, hermes_plugin  # noqa: E402

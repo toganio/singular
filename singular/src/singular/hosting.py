@@ -12,8 +12,13 @@ Run worker pool, a customer's own machine) can start the same image the same way
 ``SINGULAR_SECRETS_FILE``       ``KEY=value`` lines (default ``/run/secrets/singular.env``). ``SINGULAR_*``
                                 keys stay in this process; every other line becomes the agent's ``.env``
                                 (the customer's model key and the like).
+``SINGULAR_PACKAGE``            the agent's one-file package (``singular pack --out``), in a mounted folder. When
+                                the home is empty the agent starts from the capsule in this file; after each
+                                run the file is rewritten around the new state and recorded on the ledger
+                                (``PACKAGE``), so the file always holds the living agent.
 ``SINGULAR_CONFIG``             a ``config.yaml`` to install (the agent's model / platform settings)
-``SINGULAR_COMMAND``            what to run under the lease (default ``hermes gateway run``)
+``SINGULAR_COMMAND``            what to run under the lease (default ``hermes gateway run``); arguments
+                                after the image name in ``docker run`` replace it
 ``SINGULAR_REPORT_URL``         optional control plane endpoint; state changes are POSTed there
 ``SINGULAR_REPORT_TOKEN``       bearer token for it (put it in the secrets file)
 ==============================  =====================================================================
@@ -42,13 +47,14 @@ from pathlib import Path
 
 from . import agent as A
 from .cli import _enable_hermes_plugin, run_guarded
-from .errors import CapsuleError, SingularError
+from .errors import CapsuleError, SealError, SingularError
 from .ledger.client import open_ledger
 from .runtime import SingularGuard
 
 DEFAULT_HOME = "/agent/home"
 DEFAULT_SECRETS = "/run/secrets/singular.env"
 DEFAULT_COMMAND = "hermes gateway run"
+CAPSULE_IN_IMAGE = "/opt/singular/agent.sngcap"   # where `singular pack` bakes the capsule
 MAX_DOWNLOAD = 8 << 30
 # Never accepted on a host: the owner key is what can sell, retire or re-key the agent.
 _FORBIDDEN = ("SINGULAR_OWNER_PASSPHRASE",)
@@ -152,13 +158,47 @@ def fetch_capsule(source: str, out: Path, expect_digest: str | None = None) -> d
     return {**info, "capsule_digest": file_digest}
 
 
+def _newer_package(ledger, capsule_path: Path, capsule_digest: str) -> dict | None:
+    """The ledger's package record when it names a different capsule than this one, else None.
+
+    A different capsule is not by itself an old copy: after a sale, or after the owner exports and packs the
+    agent again, the new file carries the same sealed state under a new digest. What makes a copy old is a
+    state the ledger has moved past, which :func:`_refuse_old_copy` and the import check decide."""
+    from .capsule import read_header
+    agent_id = read_header(capsule_path)["meta"].get("agent_id")
+    record = ledger.get_agent(agent_id) if agent_id else None
+    package = (record or {}).get("package")
+    if package and package["capsule"] != capsule_digest.removeprefix("sha256:"):
+        return {**package, "agent_id": agent_id, "record": record}
+    return None
+
+
+def _old_copy(newer: dict) -> SingularError:
+    return SingularError(f"this is an old copy of agent {newer['agent_id']}: package #{newer['no']} is newer; "
+                         "start the agent from its newest package file")
+
+
+def _refuse_old_copy(ledger, capsule_path: Path, newer: dict | None) -> None:
+    """Refuse by name, before anything is unpacked, a package whose sealed roots the ledger has moved past."""
+    if not newer:
+        return
+    from .capsule import read_header
+    meta, record = read_header(capsule_path)["meta"], newer["record"]
+    memory_root = A.require_bank(ledger, record["memory_bank"])["seal"]["root"]
+    if (meta.get("core_root"), meta.get("memory_root")) != (record["seal"]["root"], memory_root):
+        raise _old_copy(newer)
+
+
 def prepare_home(home_path: Path, ledger_url: str, env: dict[str, str]) -> tuple[A.AgentHome, dict]:
-    """Import the agent into an empty home on first start; on later starts, use what the volume holds."""
+    """Import the agent into an empty home on first start; on later starts, use what the volume holds.
+    The capsule comes from the package file when one is mounted, else from ``SINGULAR_CAPSULE``."""
     home = A.AgentHome(home_path)
     if home.is_singular:
         return home, {"imported": False}
+    package = env.get("SINGULAR_PACKAGE")
+    package = Path(package) if package and Path(package).is_file() else None
     source = env.get("SINGULAR_CAPSULE")
-    if not source:
+    if not source and not package:
         raise SingularError(f"{home_path} holds no agent yet and SINGULAR_CAPSULE is not set")
     passphrase = env.get("SINGULAR_CAPSULE_PASSPHRASE")
     if not passphrase:
@@ -170,7 +210,17 @@ def prepare_home(home_path: Path, ledger_url: str, env: dict[str, str]) -> tuple
         raise SingularError(f"{home_path} is not empty but holds no Singular agent; refusing to mix the two")
     with tempfile.TemporaryDirectory(prefix="capsule-") as tmp:
         capsule_path = Path(tmp) / "agent.capsule"
-        fetched = fetch_capsule(source, capsule_path, env.get("SINGULAR_CAPSULE_DIGEST"))
+        ledger = open_ledger(ledger_url)
+        if package:
+            from . import pack
+            extracted = pack.extract_capsule(package, capsule_path)
+            fetched = {"source": "package", "capsule_digest": extracted["capsule_digest"], "image": extracted["image"]}
+        else:
+            fetched = fetch_capsule(source, capsule_path, env.get("SINGULAR_CAPSULE_DIGEST"))
+        newer = None
+        if package or source == CAPSULE_IN_IMAGE:
+            newer = _newer_package(ledger, capsule_path, fetched["capsule_digest"])
+            _refuse_old_copy(ledger, capsule_path, newer)
         from .capsule import read_header
         if read_header(capsule_path)["meta"].get("for_sale", True):
             raise SingularError("this capsule was made for a sale (it carries no agent key) and cannot run; "
@@ -178,14 +228,52 @@ def prepare_home(home_path: Path, ledger_url: str, env: dict[str, str]) -> tuple
         # unpack inside the volume (same filesystem), then move the verified files up: the volume root itself
         # cannot be renamed, and import_capsule wants a fresh folder
         staging = home_path / ".singular-import"
-        A.import_capsule(capsule_path, staging, passphrase, open_ledger(ledger_url))
+        try:
+            A.import_capsule(capsule_path, staging, passphrase, ledger)
+        except SealError as exc:   # same roots, but the action history moved on after this copy was made
+            if newer:
+                raise _old_copy(newer) from exc
+            raise
     for child in list(staging.iterdir()):
         os.replace(child, home_path / child.name)
     staging.rmdir()
     return A.AgentHome(home_path), {"imported": True, **fetched}
 
 
-def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 - configured by environment only
+def repack_package(home: A.AgentHome, ledger_url: str, env: dict[str, str], report) -> dict | None:
+    """After a run: rewrite the package file around the agent's new state and record it on the ledger."""
+    package = env.get("SINGULAR_PACKAGE")
+    if not package or not Path(package).is_file():
+        return None
+    if not env.get("SINGULAR_CAPSULE_PASSPHRASE"):
+        report("package-skipped", detail="SINGULAR_CAPSULE_PASSPHRASE is not set, so the package file was not rewritten")
+        return None
+    from . import pack
+    ledger = open_ledger(ledger_url)
+    with tempfile.TemporaryDirectory(prefix=".singular-export-", dir=Path(package).parent) as tmp:
+        capsule_path = Path(tmp) / "agent.capsule"
+        A.export_capsule(home, ledger, capsule_path, env["SINGULAR_CAPSULE_PASSPHRASE"], for_sale=False)
+        result = pack.repack(Path(package), capsule_path, ledger_url)
+    receipt = A.record_package(home, ledger, home.unlock(env["SINGULAR_PASSPHRASE"]), result["capsule_digest"],
+                               result["manifest_digest"])
+    record = ledger.get_agent(home.agent_id) or {}
+    info = {"package": package, "no": (record.get("package") or {}).get("no"), "image": result["manifest_digest"],
+            "capsule_digest": result["capsule_digest"], "size": result["size"], "receipt": receipt}
+    report("packaged", agent_id=home.agent_id, **{k: v for k, v in info.items() if k != "receipt"})
+    return info
+
+
+def _after_run(home, ledger_url, env, report) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)   # a second SIGTERM must not cut the package rewrite short
+    try:
+        repack_package(home, ledger_url, env, report)
+    except Exception as exc:  # noqa: BLE001 - the agent is safe in its home; say what went wrong
+        detail = str(exc) if isinstance(exc, SingularError) else f"{type(exc).__name__}: {exc}"
+        report("package-failed", agent_id=home.agent_id, detail=detail)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``argv``, when given, is the command to run under the lease (``docker run IMAGE hermes`` for a chat)."""
     env = dict(os.environ)
     secrets_own, dotenv = load_secrets(Path(env.get("SINGULAR_SECRETS_FILE", DEFAULT_SECRETS)))
     env.update(secrets_own)
@@ -218,15 +306,19 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 - configured by 
             os.environ.pop(key, None)
         report("running", agent_id=started["agent_id"], lease=started["lease"]["no"], epoch=started["epoch"], **how)
         agent_id = guard.agent_id
-        code = run_guarded(guard, shlex.split(env.get("SINGULAR_COMMAND", DEFAULT_COMMAND)),
-                           on_hard_exit=lambda c: report("stopped", agent_id=agent_id, exit_code=c))
+        code = run_guarded(guard, list(argv) if argv else shlex.split(env.get("SINGULAR_COMMAND", DEFAULT_COMMAND)),
+                           on_hard_exit=lambda c: (report("stopped", agent_id=agent_id, exit_code=c),
+                                                   _after_run(home, ledger_url, env, report)))
         guard.stop()
         report("stopped", agent_id=guard.agent_id, exit_code=code)
+        _after_run(home, ledger_url, env, report)
         return code
     except _Stop:
         if guard is not None:
             guard.stop()
         report("stopped", agent_id=guard.agent_id if guard else None, exit_code=0, detail="SIGTERM")
+        if guard is not None:
+            _after_run(guard.home, ledger_url, env, report)
         return 0
     except Exception as exc:  # noqa: BLE001 - whatever went wrong, let go of the lease and say so
         if guard is not None:

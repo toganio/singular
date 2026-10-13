@@ -1,6 +1,8 @@
 name: singular-hosting
 
-# Builds the hosted-agent runtime image and runs it end to end (ledger node + registry + image).
+# Builds the hosted-agent runtime image and runs it end to end (ledger node + registry + image, and a
+# `singular pack` standalone agent image). On main it publishes the runtime to ghcr.io/toganio/singular-runtime,
+# the default base `singular pack` builds agent images on.
 on:
   push:
     branches: [main]
@@ -24,5 +26,29 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build the runtime image
         run: docker build -f singular/hosting/Dockerfile -t singular-runtime:ci .
-      - name: End to end (pull, verify, lease, stop, restart)
+      - name: End to end (pull, verify, lease, stop, restart; pack a standalone image and run it)
         run: singular/hosting/e2e.sh singular-runtime:ci
+
+  publish:
+    needs: image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and push the runtime image
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' singular/src/singular/__init__.py)"
+          image=ghcr.io/toganio/singular-runtime
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GH_ACTOR" --password-stdin
+          docker build -f singular/hosting/Dockerfile \
+            --label org.opencontainers.image.source=https://github.com/toganio/singular \
+            --label org.opencontainers.image.revision="$GITHUB_SHA" \
+            -t "$image:$version" -t "$image:sha-${GITHUB_SHA::12}" -t "$image:latest" .
+          docker push --all-tags "$image"

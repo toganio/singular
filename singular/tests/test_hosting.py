@@ -34,6 +34,7 @@ class FakeRegistry:
     def __init__(self, token: str | None = None):
         self.blobs: dict[str, bytes] = {}
         self.manifests: dict[str, bytes] = {}
+        self.mounts: list[str] = []
         self.token = token
         registry = self
 
@@ -82,7 +83,12 @@ class FakeRegistry:
                 if not self._authorized():
                     return
                 self.rfile.read(int(self.headers.get("Content-Length") or 0))
-                repo = re.match(r"^/v2/(.+)/blobs/uploads/$", self.path).group(1)
+                path, _, query = self.path.partition("?")
+                repo = re.match(r"^/v2/(.+)/blobs/uploads/$", path).group(1)
+                mount = re.search(r"mount=([^&]+)", query)
+                if mount and mount.group(1).replace("%3A", ":") in registry.blobs:
+                    registry.mounts.append(mount.group(1).replace("%3A", ":"))
+                    return self._send(201)
                 self._send(202, b"", {"Location": f"/v2/{repo}/blobs/uploads/u1"})
 
             def do_PUT(self):

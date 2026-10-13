@@ -170,20 +170,24 @@ def test_clock_set_back_cannot_stretch_a_lease(tmp_path, ledger, owner, monkeypa
 
 
 def test_clock_deadline_counts_from_when_the_request_left_not_when_the_answer_arrived(agent, ledger, monkeypatch):
-    slow = {"delay": 0.0}
+    # A fake boot clock that only moves while the ledger "answers": no real sleeping, so a loaded machine cannot
+    # make this pass or fail by accident.
+    clock = {"now": 1000.0, "delay": 0.0}
+    monkeypatch.setattr(runtime, "_boot_s", lambda: clock["now"])
     real_submit = ledger.submit
 
     def slow_submit(tx):
-        time.sleep(slow["delay"])
+        clock["now"] += clock["delay"]
         return real_submit(tx)
     monkeypatch.setattr(ledger, "submit", slow_submit)
     guard = SingularGuard(agent, ledger, PASS, heartbeat=False)
-    slow["delay"] = 0.4
-    before = runtime._boot_s()
+    clock["delay"] = 0.4
+    before = clock["now"]
     guard.start()
+    assert clock["now"] > before                                            # the slow round trip did happen
     ttl = agent.identity["policy"]["lease_ttl_ms"] / 1000
-    assert guard._deadline <= before + 0.05 + ttl * runtime.LEASE_SAFETY   # the slow round trip shortened our window, not the ledger's
-    slow["delay"] = 0.0
+    assert guard._deadline == pytest.approx(before + ttl * runtime.LEASE_SAFETY)   # the slow round trip shortened our window, not the ledger's
+    clock["delay"] = 0.0
     guard.stop()
 
 
