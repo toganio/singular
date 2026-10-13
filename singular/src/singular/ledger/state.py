@@ -365,8 +365,9 @@ class LedgerState:
         if _hash(body["memory_root"], "memory_root") != self.banks[agent["memory_bank"]]["seal"]["root"]:
             _reject("STALE_STATE", "buyer must accept exactly the latest sealed internal memory")
         # The epoch bump is what silently voids every external bank grant this agent held.
+        # The seller's package file is not the buyer's: the buyer's first package starts the count again.
         agent.update(owner_pub=new_owner, agent_pub=new_agent, enc_pub=_pub(body["new_enc_pub"], "new_enc_pub"), lease=None,
-                     epoch=agent["epoch"] + 1, transfers=agent["transfers"] + 1)
+                     epoch=agent["epoch"] + 1, transfers=agent["transfers"] + 1, package=None)
 
     def _rotate_key(self, agent: dict, tx: dict, now_ms: int) -> None:
         """The agent key leaked (or might have): the owner replaces it without selling. Works even while a
@@ -386,6 +387,28 @@ class LedgerState:
         T.require_signers(tx, self.chain_id, {"owner": agent["owner_pub"]})
         agent["lease"] = None
         agent["status"] = "retired"
+
+    # -- packages --------------------------------------------------------------------------
+
+    def _package(self, agent: dict, tx: dict, now_ms: int) -> None:
+        """The agent's package (one image file holding runtime and agent) was rewritten after a run. The
+        record names the capsule and image that carry the current state, so every older copy of the file is
+        known to be old. Agent key only, no live lease, and only for the exact current state (core, internal
+        memory, action history): the newest package is always one that can start the agent."""
+        body = tx["body"]
+        T.require_fields(body, ["capsule", "image", "root", "memory_root", "actions_head"])
+        T.require_signers(tx, self.chain_id, {"agent": agent["agent_pub"]})
+        if lease_active(agent, now_ms):
+            _reject("LEASE_HELD", "record a package after the run has let go of its lease")
+        if _hash(body["root"], "root") != agent["seal"]["root"]:
+            _reject("STALE_STATE", "core files do not match the latest sealed state")
+        if _hash(body["memory_root"], "memory_root") != self.banks[agent["memory_bank"]]["seal"]["root"]:
+            _reject("STALE_STATE", "internal memory does not match its latest sealed state")
+        if _hash(body["actions_head"], "actions_head") != agent["actions"]["head"]:
+            _reject("STALE_STATE", "the action history does not end at the anchored head")
+        number = (agent.get("package") or {}).get("no", 0) + 1
+        agent["package"] = {"no": number, "capsule": _hash(body["capsule"], "capsule"),
+                            "image": _hash(body["image"], "image"), "ts": now_ms}
 
     # -- memory banks ----------------------------------------------------------------------
 

@@ -17,8 +17,9 @@ REGISTRY_IMAGE="${REGISTRY_IMAGE:-registry:2}"
 COMMAND="${E2E_COMMAND:-hermes gateway run}"
 
 cleanup() {
-  docker rm -f "$RUN_ID-agent" "$RUN_ID-ledger" "$RUN_ID-registry" >/dev/null 2>&1 || true
-  docker volume rm "$RUN_ID-home" "$RUN_ID-chain" >/dev/null 2>&1 || true
+  docker rm -f "$RUN_ID-agent" "$RUN_ID-copy" "$RUN_ID-ledger" "$RUN_ID-registry" >/dev/null 2>&1 || true
+  docker volume rm "$RUN_ID-home" "$RUN_ID-home-bo" "$RUN_ID-home-copy" "$RUN_ID-chain" >/dev/null 2>&1 || true
+  docker rmi "$RUN_ID-bo:v1" "$RUN_ID-bo:v2" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
@@ -98,5 +99,99 @@ wait_log '"imported": false'
 [ "$(lease)" = held ] && echo "ledger: lease held again"
 docker stop -t 60 "$RUN_ID-agent" >/dev/null
 [ "$(lease)" = free ] && echo "ledger: lease released"
+docker rm "$RUN_ID-agent" >/dev/null
 
-printf '\nPASS: pull, verify, run under the lease, release on stop, restart from the volume\n'
+step "standalone: bake a second agent into one file with \`singular pack\`"
+docker save "$IMAGE" -o "$WORK/runtime.tar"
+chmod 644 "$WORK/runtime.tar"
+mkdir -p "$WORK/bo" "$WORK/pkg" "$WORK/old" && printf 'You are Bo, a travel planner.\n' > "$WORK/bo/SOUL.md"
+docker run --rm --network "$NET" -v "$WORK:/work" --user "$(id -u):$(id -g)" -e HOME=/work "${export_env[@]}" \
+  -e SINGULAR_ALLOW_INSECURE_LEDGER=1 --entrypoint sh "$IMAGE" -c '
+    set -e
+    singular init --owner-key /work/owner.keystore.json --ledger http://ledger:8765 --home /work/bo \
+      --name Bo --function "e2e travel planner" --lease-ttl 120 > /work/bo-init.json
+    singular export --home /work/bo --move --out /work/bo.capsule >/dev/null
+    singular pack /work/bo.capsule --ledger http://ledger:8765 --base /work/runtime.tar --out /work/pkg/bo.tar --tag "'"$RUN_ID"'-bo:v1" > /work/pack.json'
+cat "$WORK/pack.json"
+rm -f "$WORK/runtime.tar" "$WORK/bo.capsule"
+cp "$WORK/pkg/bo.tar" "$WORK/old/bo.tar"
+AGENT_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_id"])' "$WORK/bo-init.json")"
+docker load -i "$WORK/pkg/bo.tar"
+BO_IMAGE="$RUN_ID-bo:v1"
+package_no() { in_image python -c "import sys; from singular.ledger.client import HttpLedger
+a = HttpLedger('http://ledger:8765').get_agent(sys.argv[1]); print((a.get('package') or {}).get('no', 0))" "$AGENT_ID"; }
+
+step "run it: read-only, no volume, only the folder holding the file and the agent's passphrases"
+start_bo() {  # name, folder mounted at /package; the agent can write only its own home and that folder
+  docker run -d --name "$1" --network "$NET" --read-only --tmpfs /tmp --user "$(id -u):0" -v "$2:/package" \
+    -e SINGULAR_PASSPHRASE=agent-pass-e2e -e SINGULAR_CAPSULE_PASSPHRASE=capsule-pass-e2e \
+    -e SINGULAR_ALLOW_INSECURE_LEDGER=1 "$BO_IMAGE" $COMMAND >/dev/null
+}
+wait_for_exit() { for _ in $(seq 60); do [ "$(docker inspect -f '{{.State.Running}}' "$1")" = false ] && return 0; sleep 1; done; return 1; }
+start_bo "$RUN_ID-agent" "$WORK/pkg"
+wait_log "singular-host: running"
+docker logs "$RUN_ID-agent" 2>&1 | grep "singular-host: running"
+[ "$(lease)" = held ] && echo "ledger: Bo's lease held"
+
+step "a second copy started on the same file cannot run while the first lives"
+start_bo "$RUN_ID-copy" "$WORK/pkg"
+wait_for_exit "$RUN_ID-copy"
+docker logs "$RUN_ID-copy" 2>&1 | grep "singular-host: failed"
+[ "$(docker inspect -f '{{.State.ExitCode}}' "$RUN_ID-copy")" != 0 ] && echo "copy refused"
+[ "$(lease)" = held ] && echo "the first one keeps running"
+docker rm -v "$RUN_ID-copy" >/dev/null
+
+step "docker stop: seal, release, rewrite the file, record it on the ledger"
+before="$(sha256sum "$WORK/pkg/bo.tar" | cut -c1-64)"
+docker stop -t 120 "$RUN_ID-agent" >/dev/null
+docker logs "$RUN_ID-agent" 2>&1 | grep "singular-host: packaged"
+[ "$(lease)" = free ] && echo "ledger: lease released"
+[ "$(sha256sum "$WORK/pkg/bo.tar" | cut -c1-64)" != "$before" ] && echo "the file now holds the new state"
+[ "$(package_no)" = 1 ] && echo "ledger: package #1 recorded"
+docker rm -v "$RUN_ID-agent" >/dev/null   # the container and its scratch home are gone: only the file is left
+
+step "start again from nothing but the file"
+start_bo "$RUN_ID-agent" "$WORK/pkg"
+wait_log '"source": "package"'
+[ "$(lease)" = held ] && echo "ledger: running again, from the file"
+docker stop -t 120 "$RUN_ID-agent" >/dev/null
+docker logs "$RUN_ID-agent" 2>&1 | grep -q "singular-host: packaged" && [ "$(package_no)" = 2 ] && echo "ledger: package #2 recorded"
+docker rm -v "$RUN_ID-agent" >/dev/null
+
+step "the owner exports and packs the agent again: the new file starts (same state, new digest)"
+docker save "$IMAGE" -o "$WORK/runtime.tar"
+chmod 644 "$WORK/runtime.tar"
+mkdir -p "$WORK/pkg2"
+docker run --rm --network "$NET" -v "$WORK:/work" --user "$(id -u):$(id -g)" -e HOME=/work "${export_env[@]}" \
+  -e SINGULAR_ALLOW_INSECURE_LEDGER=1 --entrypoint sh "$IMAGE" -c '
+    set -e
+    singular export --home /work/bo --move --out /work/bo2.capsule >/dev/null
+    singular pack /work/bo2.capsule --ledger http://ledger:8765 --base /work/runtime.tar --out /work/pkg2/bo.tar --tag "'"$RUN_ID"'-bo:v2" >/dev/null'
+rm -f "$WORK/runtime.tar" "$WORK/bo2.capsule"
+docker load -i "$WORK/pkg2/bo.tar" >/dev/null
+BO_IMAGE="$RUN_ID-bo:v2" start_bo "$RUN_ID-agent" "$WORK/pkg2"
+wait_log '"source": "package"'
+[ "$(lease)" = held ] && echo "ledger: the new file runs"
+docker stop -t 120 "$RUN_ID-agent" >/dev/null
+docker logs "$RUN_ID-agent" 2>&1 | grep -q "singular-host: packaged" && [ "$(package_no)" = 3 ] && echo "ledger: package #3 recorded"
+docker rm -v "$RUN_ID-agent" >/dev/null
+
+step "the agent learns something; the old copy of the file is now behind the ledger and refused"
+in_image python -c "from pathlib import Path
+from singular import agent as A
+from singular.ledger.client import HttpLedger
+from singular.runtime import SingularGuard
+home = A.AgentHome(Path('/work/bo'))
+guard = SingularGuard(home, HttpLedger('http://ledger:8765'), 'agent-pass-e2e')
+guard.start()
+intent = guard.begin_action('memory', {'path': 'memories/MEMORY.md'})
+(home.home / 'memories').mkdir(exist_ok=True)
+(home.home / 'memories' / 'MEMORY.md').write_text('- the client flies on Fridays\\n')
+guard.end_action(intent, 'memory', {'ok': True})
+guard.stop()"
+start_bo "$RUN_ID-copy" "$WORK/old"
+wait_for_exit "$RUN_ID-copy"
+docker logs "$RUN_ID-copy" 2>&1 | grep "old copy"
+[ "$(lease)" = free ] && echo "old copy refused; nothing runs"
+
+printf '\nPASS: pull, verify, run under the lease, release on stop, restart from the volume; a one-file agent runs alone, rewrites its file on stop, comes back from it, a re-packed file starts, and old copies are refused\n'

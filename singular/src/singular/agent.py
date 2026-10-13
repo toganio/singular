@@ -404,6 +404,18 @@ def export_capsule(agent_home: AgentHome, ledger: Ledger, out_path: Path, capsul
             base.write_text(previous, encoding="utf-8") if previous is not None else base.unlink()
 
 
+def record_package(agent_home: AgentHome, ledger: Ledger, agent_key: SigningKey, capsule_digest: str,
+                   image_digest: str) -> dict:
+    """Put on the ledger that this capsule, inside this image, is now the agent's package (``PACKAGE``)."""
+    report = verify(agent_home, ledger)
+    record = require_agent(ledger, agent_home.agent_id)
+    body = {"capsule": capsule_digest.removeprefix("sha256:"), "image": image_digest.removeprefix("sha256:"),
+            "root": report["core"]["root"], "memory_root": report["memory"]["root"],
+            "actions_head": record["actions"]["head"]}
+    return submit(ledger, agent_home.identity["chain_id"], T.PACKAGE, agent_home.agent_id, record["nonce"] + 1,
+                  body, {"agent": agent_key})
+
+
 def import_capsule(capsule_path: Path, target: Path, capsule_passphrase: str, ledger: Ledger) -> AgentHome:
     """Unpack, then trust nothing: the unpacked files must hash to what the ledger sealed."""
     capsule.unpack(capsule_path, target, capsule_passphrase)
