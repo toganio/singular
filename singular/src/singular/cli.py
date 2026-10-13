@@ -255,6 +255,16 @@ def cmd_transfer(args) -> int:
         name = A.require_agent(ledger, agent_id)["descriptor"]["name"]
         receipt = A.transfer_approve(request, ledger, _owner_key(args), agent_id)
         _print({"sold": agent_id, "name": name, "new_owner_pub": request["tx"]["body"].get("new_owner_pub"), "receipt": receipt})
+    elif args.step == "handover":
+        if not (args.source and args.keystore):
+            raise SingularError("handover needs --from (the seller's agent home) and --keystore (the buyer's new agent key)")
+        source = A.AgentHome(args.source)
+        if not source.is_singular:
+            raise SingularError(f"{source.home} is not a Singular agent")
+        target = args.home or os.environ.get("SINGULAR_HOME") or os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+        ledger = open_ledger(args.ledger or os.environ.get("SINGULAR_LEDGER") or source.identity["ledger_url"])
+        bought = A.handover(source, Path(target), ledger, json.loads(Path(args.keystore).read_text(encoding="utf-8")))
+        _print({"agent_id": bought.agent_id, "home": str(bought.home), "handed_over": True})
     else:
         home = _home(args)
         A.transfer_finalize(home, _ledger_for(home, args))
@@ -409,9 +419,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p.add_argument("capsule")
     p.add_argument("--home", required=True)
     p = add("transfer", cmd_transfer, "sell / hand over an agent", home=True, owner=True)
-    p.add_argument("step", choices=["request", "approve", "finalize"])
+    p.add_argument("step", choices=["request", "approve", "finalize", "handover"])
     p.add_argument("--file", default="transfer-request.json")
     p.add_argument("--agent", help="approve: id of the agent you mean to sell (default: the agent in --home)")
+    p.add_argument("--from", dest="source", help="handover: the sold agent's home on this host (left untouched)")
+    p.add_argument("--keystore", help="handover: the new agent key the buyer made; --home receives the agent")
     p = add("owner", cmd_owner_action, "owner-only actions", home=True, owner=True)
     p.add_argument("action", choices=["revoke-lease", "rotate-key", "retire", "rollback", "attest", "allow-edits", "forbid-edits"])
     p.add_argument("--root")

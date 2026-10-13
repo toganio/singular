@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 from . import capsule, tree
@@ -484,3 +485,40 @@ def transfer_finalize(agent_home: AgentHome, ledger: Ledger) -> None:
     if record["agent_pub"] != load_keystore(pending)["pub"]:
         raise SingularError("the ledger does not show this transfer yet")
     os.replace(pending, agent_home.keystore_path)
+
+
+def handover(source_home: AgentHome, target: Path, ledger: Ledger, new_keystore: dict) -> AgentHome:
+    """Hand a sold agent's files to its new owner on the same host, with no file passing between people.
+
+    Runs after the TRANSFER landed. ``new_keystore`` is the agent key the buyer made (and wrapped under their own
+    passphrase) when they asked to buy: the ledger must already name it. What reaches ``target`` is exactly what a
+    for-sale capsule carries, so the seller's old key and private action records stay behind, and it is checked
+    against the ledger the same way an import is. The source home is left as it was; the caller deletes it."""
+    record = require_agent(ledger, source_home.agent_id)
+    if new_keystore.get("kind") != "singular-keystore" or new_keystore.get("v") != 1 or new_keystore.get("label") != "agent":
+        raise SingularError("that is not an agent keystore")
+    if new_keystore.get("pub") != record["agent_pub"]:
+        raise SingularError("the ledger does not name this agent key; has the transfer landed?")
+    # the seller's own key still being current means no transfer happened: copying it would make two live homes
+    if source_home.keystore_path.exists() and load_keystore(source_home.keystore_path)["pub"] == record["agent_pub"]:
+        raise SingularError("the ledger still names the seller's agent key; has the transfer landed?")
+    target = Path(target)
+    source_root = source_home.home.resolve()
+    if target.resolve() == source_root or target.resolve().is_relative_to(source_root):
+        raise SingularError("the new home must be outside the seller's home, which is deleted after the handover")
+    existed = target.exists()
+    capsule_passphrase = os.urandom(24).hex()
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            packed = Path(scratch) / "handover.capsule"
+            export_capsule(source_home, ledger, packed, capsule_passphrase, for_sale=True)
+            bought = import_capsule(packed, target, capsule_passphrase, ledger)
+        # the buyer may have resold or re-keyed meanwhile; install the key only if it is still the current one
+        if require_agent(ledger, source_home.agent_id)["agent_pub"] != new_keystore["pub"]:
+            raise SingularError("the ledger moved on to another agent key during the handover; nothing was delivered")
+        save_keystore(bought.keystore_path, new_keystore)
+    except BaseException:
+        if not existed:
+            shutil.rmtree(target, ignore_errors=True)
+        raise
+    return bought
