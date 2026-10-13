@@ -69,6 +69,21 @@ def test_handover_refuses_an_owner_keystore(agent, ledger, owner, tmp_path):
         A.handover(agent, tmp_path / "buyer", ledger, wrap_key(owner, PASS, label="owner"))
 
 
+def test_handover_refuses_the_sellers_own_live_key(agent, ledger, tmp_path):
+    from singular.keys import load_keystore
+    with pytest.raises(SingularError, match="still names the seller"):
+        A.handover(agent, tmp_path / "buyer", ledger, json.loads(agent.keystore_path.read_text()))
+    assert load_keystore(agent.keystore_path)["pub"] == ledger.get_agent(agent.agent_id)["agent_pub"]
+    assert not (tmp_path / "buyer").exists()
+
+
+def test_handover_refuses_a_target_inside_the_sellers_home(agent, ledger, owner):
+    _, keystore = sold_with_history(agent, ledger, owner)
+    with pytest.raises(SingularError, match="outside the seller"):
+        A.handover(agent, agent.home / "staging" / "buyer", ledger, keystore)
+    assert not (agent.home / "staging").exists()
+
+
 def test_handover_cli(agent, ledger, owner, tmp_path, monkeypatch):
     from singular import cli
     _, keystore = sold_with_history(agent, ledger, owner)

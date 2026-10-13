@@ -499,10 +499,26 @@ def handover(source_home: AgentHome, target: Path, ledger: Ledger, new_keystore:
         raise SingularError("that is not an agent keystore")
     if new_keystore.get("pub") != record["agent_pub"]:
         raise SingularError("the ledger does not name this agent key; has the transfer landed?")
+    # the seller's own key still being current means no transfer happened: copying it would make two live homes
+    if source_home.keystore_path.exists() and load_keystore(source_home.keystore_path)["pub"] == record["agent_pub"]:
+        raise SingularError("the ledger still names the seller's agent key; has the transfer landed?")
+    target = Path(target)
+    source_root = source_home.home.resolve()
+    if target.resolve() == source_root or target.resolve().is_relative_to(source_root):
+        raise SingularError("the new home must be outside the seller's home, which is deleted after the handover")
+    existed = target.exists()
     capsule_passphrase = os.urandom(24).hex()
-    with tempfile.TemporaryDirectory() as scratch:
-        packed = Path(scratch) / "handover.capsule"
-        export_capsule(source_home, ledger, packed, capsule_passphrase, for_sale=True)
-        bought = import_capsule(packed, Path(target), capsule_passphrase, ledger)
-    save_keystore(bought.keystore_path, new_keystore)
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            packed = Path(scratch) / "handover.capsule"
+            export_capsule(source_home, ledger, packed, capsule_passphrase, for_sale=True)
+            bought = import_capsule(packed, target, capsule_passphrase, ledger)
+        # the buyer may have resold or re-keyed meanwhile; install the key only if it is still the current one
+        if require_agent(ledger, source_home.agent_id)["agent_pub"] != new_keystore["pub"]:
+            raise SingularError("the ledger moved on to another agent key during the handover; nothing was delivered")
+        save_keystore(bought.keystore_path, new_keystore)
+    except BaseException:
+        if not existed:
+            shutil.rmtree(target, ignore_errors=True)
+        raise
     return bought
