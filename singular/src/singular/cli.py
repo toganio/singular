@@ -218,6 +218,13 @@ def cmd_pack(args) -> int:
     return 0
 
 
+def cmd_unlock(args) -> int:
+    from . import unlock
+    home = args.home or os.environ.get("SINGULAR_HOME") or os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    url = args.ledger or os.environ.get("SINGULAR_LEDGER") or A.AgentHome(home).identity["ledger_url"]
+    return unlock.main(args.step, home, open_ledger(url), args.input)
+
+
 def cmd_export(args) -> int:
     home = _home(args)
     header = A.export_capsule(home, _ledger_for(home, args), Path(args.out),
@@ -266,6 +273,8 @@ def cmd_owner_action(args) -> int:
         _print(A.retire(home.agent_id, ledger, chain_id, key))
     elif args.action == "rollback":
         _print(A.rollback(home, ledger, key, args.root))
+    elif args.action in ("allow-edits", "forbid-edits"):
+        _print(A.set_owner_edits(home.agent_id, ledger, chain_id, key, args.action == "allow-edits"))
     else:
         _print(A.owner_attest(home, ledger, key, args.reason))
     return 0
@@ -388,6 +397,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     where.add_argument("--out", help="write the image as one file (OCI archive for `docker load` / `podman load`)")
     p.add_argument("--tag", help="--out: the name `docker load` gives it, e.g. ada:latest")
     p.add_argument("--platform", default="linux/amd64")
+    p = add("unlock", cmd_unlock, "owner edits from elsewhere: describe the agent, apply edits sealed by the owner's own signature (JSON on stdin/stdout)")
+    p.add_argument("step", choices=["describe", "apply"])
+    p.add_argument("--home", help="agent home (default: $SINGULAR_HOME, $HERMES_HOME or ~/.hermes)")
+    p.add_argument("--ledger", help="ledger url (default: $SINGULAR_LEDGER, then the one stored in the agent)")
+    p.add_argument("--input", help="apply: read the request from this file instead of stdin")
     p = add("export", cmd_export, "pack the agent into an encrypted capsule", home=True)
     p.add_argument("--out", required=True)
     p.add_argument("--move", action="store_true", help="moving your OWN agent: include its key and action records (never use for a sale)")
@@ -399,7 +413,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     p.add_argument("--file", default="transfer-request.json")
     p.add_argument("--agent", help="approve: id of the agent you mean to sell (default: the agent in --home)")
     p = add("owner", cmd_owner_action, "owner-only actions", home=True, owner=True)
-    p.add_argument("action", choices=["revoke-lease", "rotate-key", "retire", "rollback", "attest"])
+    p.add_argument("action", choices=["revoke-lease", "rotate-key", "retire", "rollback", "attest", "allow-edits", "forbid-edits"])
     p.add_argument("--root")
     p.add_argument("--reason", default="owner edit")
     p = add("prove", cmd_prove, "prove to a service that you own an agent (signs a one-time challenge locally)", owner=True)

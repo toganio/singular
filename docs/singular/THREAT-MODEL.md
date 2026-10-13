@@ -15,8 +15,13 @@
   *afterwards*. The read itself is on the agent's action log; the rest is a contract matter.
 * It **cannot tell an honest crash from an outside edit.** Both leave files that do not match the last
   seal. Recovery is `singular restore` (back to the last sealed state; Singular re-seals right after
-  every memory/skill write, so little is lost) — or, only if the agent was registered with
-  `--allow-owner-edits`, an owner-attested seal that the ledger permanently marks as human intervention.
+  every memory/skill write, so little is lost) — or, only while the agent's policy allows owner edits
+  (`--allow-owner-edits` at registration, or `singular owner allow-edits` later, itself a public `OWNER_POLICY`
+  transaction), an owner-attested seal of the core and/or memory that the ledger permanently marks as human
+  intervention. A buyer reads the policy and every such seal in the history before buying. With `singular unlock`
+  the host applying the edits never holds the owner key: it can refuse an edit, but it cannot make the owner's
+  signature cover content other than what the owner's client hashed. It can, however, show that client a wrong
+  starting state; a client that cares checks the entries' root against the ledger it trusts.
 * It **cannot bind a key to a legal person.** The ledger proves *which key* owned and ran the agent
   when. Tying that key to a company or a human is an off-chain (KYC / contract) step.
 * v0.1 has **one block producer** (proof of authority). A malicious validator cannot forge agent or
