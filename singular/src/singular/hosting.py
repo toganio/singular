@@ -263,6 +263,31 @@ def repack_package(home: A.AgentHome, ledger_url: str, env: dict[str, str], repo
     return info
 
 
+def package_bought(home: A.AgentHome, ledger_url: str, package: Path, base: str, env: dict[str, str]) -> dict:
+    """After ``transfer handover`` on a host: make the bought agent's one-file package and record it (``PACKAGE``).
+
+    The buyer's new agent key signs, so the package is theirs from its first version; from then on the supervisor
+    rewrites the same file after each run (:func:`repack_package`). ``base`` is the runtime image to build on
+    (a registry reference or a ``docker save`` archive)."""
+    for key in ("SINGULAR_PASSPHRASE", "SINGULAR_CAPSULE_PASSPHRASE"):
+        if not env.get(key):
+            raise SingularError(f"{key} is needed to package the bought agent")
+    from . import pack
+    agent_key = home.unlock(env["SINGULAR_PASSPHRASE"])   # a wrong passphrase stops here, before anything is built
+    ledger = open_ledger(ledger_url)
+    package = Path(package)
+    package.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".singular-export-", dir=package.parent) as tmp:
+        capsule_path = Path(tmp) / "agent.capsule"
+        A.export_capsule(home, ledger, capsule_path, env["SINGULAR_CAPSULE_PASSPHRASE"], for_sale=False)
+        capsule_digest = "sha256:" + hashlib.sha256(capsule_path.read_bytes()).hexdigest()
+        result = pack.pack(capsule_path, ledger_url, base=base, out=package)
+    receipt = A.record_package(home, ledger, agent_key, capsule_digest, result["manifest_digest"])
+    record = ledger.get_agent(home.agent_id) or {}
+    return {"package": str(package), "no": (record.get("package") or {}).get("no"), "image": result["manifest_digest"],
+            "capsule_digest": capsule_digest, "size": result["size"], "receipt": receipt}
+
+
 def _after_run(home, ledger_url, env, report) -> None:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)   # a second SIGTERM must not cut the package rewrite short
     try:

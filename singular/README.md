@@ -67,6 +67,10 @@ key and signs, the seller signs last, and the host moves the files with
 `singular transfer handover --from <seller's home> --keystore <buyer's new agent key> --home <buyer's home>`.
 What it copies is exactly a for-sale capsule's contents (no seller key, no private history), checked against the
 ledger like an import, and only once the ledger names the buyer's key.
+With `--package <file> --base <runtime image>` the bought agent also leaves the handover as its own one-file
+package (`singular pack --out`), recorded on the ledger (`PACKAGE`) with the buyer's new agent key, so the buyer's
+agent is one file from its first version; the host passes `SINGULAR_PASSPHRASE` and `SINGULAR_CAPSULE_PASSPHRASE`
+in its secrets file.
 
 A shared memory bank:
 
