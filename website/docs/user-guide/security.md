@@ -15,7 +15,7 @@ The security model has eight layers:
 1. **User authorization** — who can talk to the agent (allowlists, DM pairing)
 2. **Dangerous command approval** — human-in-the-loop for destructive operations
 3. **File write safety** — denylist and optional write sandbox for `write_file`/`patch`
-4. **Container isolation** — Docker/Singularity/Modal sandboxing with hardened settings
+4. **Container isolation** — Docker/Modal (and the Singularity plugin) sandboxing with hardened settings
 5. **MCP credential filtering** — environment variable isolation for MCP subprocesses
 6. **Context file scanning** — prompt injection detection in project files
 7. **Cross-session isolation** — sessions cannot access each other's data or state; cron job storage paths are hardened against path traversal attacks
@@ -48,7 +48,7 @@ The full set of keys:
 | `timeout` | `300` | Seconds Hermes waits for an approval reply before timing out. |
 | `cron_mode` | `deny` | How [cron jobs](./features/cron.md) behave headlessly when they trigger a dangerous-command prompt. `deny` blocks the command (the agent must find another path); `approve` auto-approves everything in cron context. |
 | `single_query_mode` | `deny` | How one-shot [`hermes chat -q`](./cli.md) sessions behave when they trigger a dangerous-command prompt. A `-q` session runs a single turn and exits with no user waiting to answer prompts; `deny` blocks the command (the agent must find another path), `approve` auto-approves everything in single-query context. Mirrors `cron_mode`. |
-| `unattended_mode` | `deny` | How sessions on unattended programmatic platforms (webhook, msgraph_webhook, api_server) behave when they trigger a dangerous-command prompt. These surfaces have no human who can answer `/approve`, so instead of blocking for the full approval timeout, `deny` blocks the command instantly (the agent must find another path) and `approve` auto-approves everything in unattended context. Mirrors `cron_mode`. |
+| `unattended_mode` | `deny` | How sessions on unattended programmatic platforms (webhook, msgraph_webhook, api_server) behave when they trigger a dangerous-command prompt. These surfaces have no human who can answer `/approve`, so instead of blocking for the full approval timeout, `deny` blocks the command instantly (the agent must find another path) and `approve` auto-approves everything in unattended context. Exception: an api_server session whose client can answer the card (`/v1/runs` and streaming chat completions, via `POST /v1/runs/{id}/approval`) still gets the approval request. Mirrors `cron_mode`. |
 | `mcp_reload_confirm` | `true` | When true, `/reload-mcp` asks before rebuilding the MCP tool set. Rebuilding invalidates the provider prompt cache (tool schemas live in the system prompt), so the next message re-sends full input tokens. Users who click **Always Approve** flip this key to `false`. |
 | `destructive_slash_confirm` | `true` | When true, destructive session slash commands (`/clear`, `/new`, `/reset`, `/undo`) prompt before discarding conversation state. Three-option dialog (Approve Once / Always Approve / Cancel) routed through native yes/no buttons on Telegram, Discord, and Slack; text fallback elsewhere. Users who click **Always Approve** flip this key to `false`. The TUI also honors this setting for its `/clear`, `/new`, and `/reset` modal; `HERMES_TUI_NO_CONFIRM=1` force-skips that modal regardless of the configured value. |
 
@@ -236,8 +236,18 @@ The following patterns trigger approval prompts (defined in `tools/approval.py`)
 | `podman --remote`/`-r`/`--url`/`--connection`/`--identity`, `CONTAINER_HOST=` | Podman remote daemon redirect |
 
 :::info
-**Container bypass**: When running in `docker`, `singularity`, `modal`, `daytona`, or `vercel_sandbox` backends, dangerous command checks are **skipped** because the container itself is the security boundary. Destructive commands inside a container can't harm the host.
+**Container bypass**: When running in `docker`, `modal`, `daytona`, or `vercel_sandbox` backends (or a container plugin backend such as `singularity`), dangerous command checks are **skipped** because the container itself is the security boundary. Destructive commands inside a container can't harm the host.
 :::
+
+### `execute_code` Scripts {#execute-code-scripts}
+
+A script run by [`execute_code`](./features/code-execution.md) can call `subprocess`, `os` or `shutil` directly, and those calls never pass through the patterns above. Messaging, API and other gateway sessions therefore ask once for the whole script before it starts; a denied or unanswered script never runs. `cron_mode`, `single_query_mode` and `unattended_mode` decide the script at once, as they decide a command; YOLO and `mode: off` skip the prompt.
+
+Local sessions (classic CLI, TUI, Desktop, ACP editor) follow the interactive CLI's rule instead. Under `manual` (and `smart`), a turn the session's viewer typed gets **no whole-script approval**: Python-level file and process operations inside the script run without a prompt, and only the script's `terminal()` calls ask, each on the session's own prompt, as in the CLI before the one-gateway runtime. The exemption needs both a turn the viewer submitted and a viewer attached who can answer approvals when the script starts. These keep the whole-script approval in a local session:
+
+- turns nobody typed in it: plugin `inject_message` turns, delegation completions, background-process and watch-pattern notices, `/loop` ticks, heartbeats, hosted-room tasks
+- `delegate_task` children and `/bg` / `/btw` side tasks
+- a viewer's turn that runs while no viewer who can approve is attached
 
 ### Approval Flow (CLI)
 
@@ -590,7 +600,7 @@ If you add names to `terminal.docker_forward_env`, those variables are intention
 | **local** | None — runs on host | ✅ Yes | Development, trusted users |
 | **ssh** | Remote machine | ✅ Yes | Running on a separate server |
 | **docker** | Container | ❌ Skipped (container is boundary) | Production gateway |
-| **singularity** | Container | ❌ Skipped | HPC environments |
+| **singularity** (plugin) | Container | ❌ Skipped | HPC environments |
 | **modal** | Cloud sandbox | ❌ Skipped | Scalable cloud isolation |
 | **daytona** | Cloud sandbox | ❌ Skipped | Persistent cloud workspaces |
 | **vercel_sandbox** | Cloud microVM | ❌ Skipped | Cloud execution with snapshot persistence |
