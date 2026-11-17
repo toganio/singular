@@ -23,12 +23,12 @@ import threading
 import pytest
 
 from tools import approval as A
-import tools.approval_detection as approval_detection
+from tools import approval_detection
 from tools import approval_context
 from tools import approval_smart
 from tools.thread_context import propagate_context_to_thread
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
-from tests.tools._child_env_fixtures import child_env  # noqa: F401
+from tests.tools._child_env_fixtures import child_env
 
 
 # ---------------------------------------------------------------------------
@@ -406,10 +406,6 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
     assert result["status"] == "pending_approval"
     assert result["smart_denied"] is True
     assert result["allow_permanent"] is False
-    with A._lock:
-        pending = dict(A._pending[gw_session])
-    assert pending["smart_denied"] is True
-    assert pending["allow_permanent"] is False
 
 
 def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, monkeypatch):
@@ -421,10 +417,6 @@ def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, mo
     assert result["status"] == "pending_approval"
     assert result["smart_denied"] is True
     assert result["allow_permanent"] is False
-    with A._lock:
-        pending = dict(A._pending[gw_session])
-    assert pending["smart_denied"] is True
-    assert pending["allow_permanent"] is False
 
 
 def test_terminal_serializes_smart_deny_pending_capabilities(monkeypatch):

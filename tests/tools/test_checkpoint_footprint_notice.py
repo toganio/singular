@@ -21,16 +21,19 @@ def _write_config(enabled: bool, cap_mb: int) -> None:
         yaml.safe_dump({"checkpoints": {"enabled": enabled, "max_total_size_mb": cap_mb}}), encoding="utf-8")
 
 def test_notice_only_when_enabled_and_over_cap(tmp_path, monkeypatch):
-    base = get_hermes_home() / "checkpoints"
-    monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", base)
     work = tmp_path / "proj"
     work.mkdir()
     (work / "blob.bin").write_bytes(os.urandom(2 * 1024 * 1024))  # incompressible → store > 1 MB
     _write_config(enabled=True, cap_mb=1)
     assert CheckpointManager(enabled=True, max_total_size_mb=1).ensure_checkpoint(str(work), "seed")
 
+    def unexpected_git(*args, **kwargs):
+        raise AssertionError("A storage notice must not inspect commit history")
+
+    monkeypatch.setattr("tools.checkpoint_maintenance._run_git", unexpected_git)
     notice = checkpoint_footprint_notice()
     assert notice
+    assert "across 1 project(s)" in notice
 
     _write_config(enabled=True, cap_mb=500)  # under the cap: no nag for a healthy store
     assert checkpoint_footprint_notice() is None
