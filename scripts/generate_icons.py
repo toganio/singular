@@ -43,7 +43,7 @@ fitted face and hair stay fixed. Standalone wordmarks remain centered.
 
 GENERATED OUTPUTS ARE COMMITTED. Regular builds and installs consume them and
 never render; flavored release bundles (canary/commit) render to a product dir.
-icons-freshness-check.yml regenerates, runs --check, and fails on any diff.
+The icon step of repo-guards.yml regenerates, runs --check, and fails on any diff.
 
 Rendering: resvg (resvg-py) for SVG -> PNG fidelity at every size.
 Containers: Pillow for multi-size .ico and .icns.
@@ -116,9 +116,10 @@ except ImportError:
 # on the runtime dependencies without the application package installed
 # (Docker, bundles). tests/scripts/test_icon_flavors.py pins it to the canonical one.
 _CANARY_TAG_RE = re.compile(
-    r"^v(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
-    r"\+canary\.20\d{6}T\d{6}Z$"
+    r"^canary\.(?P<stamp>20\d{6}T\d{6}Z)-v(?P<core>(?:0|[1-9]\d{0,2})\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$"
 )
+# Commit claims use the same stamped grammar, but retain the SHA badge identity.
+_COMMIT_TAG_RE = re.compile(_CANARY_TAG_RE.pattern.replace("canary", "commit"))
 
 # The nous dark background (#0d1117) — fixed dark tile/background everywhere.
 DARK_HEX = "#0d1117"
@@ -321,7 +322,7 @@ def girl_path(art: IconArt, girl: str) -> str:
     undeclared inkscape/sodipodi prefixes)."""
     if girl not in art.paths:
         src = art.girls[girl].read_text(encoding="utf-8-sig")
-        m = re.search(r"<path\b.*?/>", src, re.S)
+        m = re.search(r"<path\b.*?/>", src, re.DOTALL)
         assert m, f"no <path> found in {art.girls[girl].name}"
         path = re.sub(r'\s+(inkscape|sodipodi):[a-zA-Z-]+="[^"]*"', "", m.group(0))
         art.paths[girl] = path
@@ -859,7 +860,7 @@ def build_art(source: Path) -> tuple[IconArt, IconArt]:
     tag = os.environ.get("HERMES_PAYLOAD_TAG", "")
     commit = os.environ.get("HERMES_BUILD_COMMIT", "")
     if commit:
-        if tag:
+        if tag and not _COMMIT_TAG_RE.fullmatch(tag):
             raise ValueError("Commit builds cannot also select HERMES_PAYLOAD_TAG")
         if not re.fullmatch(r"[a-f0-9]{40}", commit):
             raise ValueError("HERMES_BUILD_COMMIT requires an exact full 40-character SHA")
@@ -881,7 +882,7 @@ def cmd_write(source: Path, out: Path) -> int:
             selected = desktop_art if rel.startswith("apps/desktop/") else art
             path.write_bytes(target_bytes(selected, kind, arg))
             written += 1
-        except Exception as exc:  # noqa: BLE001 - report all, then fail
+        except Exception as exc:
             failures += 1
             print(f"  !! {rel}: FAILED ({exc})")
     print(f"[write] wrote {written}/{len(TARGETS)} files")
@@ -926,7 +927,7 @@ def cmd_check(source: Path, out: Path) -> int:
         try:
             selected = desktop_art if rel.startswith("apps/desktop/") else art
             target_bytes(selected, kind, arg)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             problems.append(f"{rel}: REGENERATE FAILED ({exc})")
 
     # PNG targets must have the expected format + size
@@ -939,7 +940,7 @@ def cmd_check(source: Path, out: Path) -> int:
             im = Image.open(path)
             if im.format != fmt or im.size != size:
                 problems.append(f"{rel}: got {im.format} {im.size}, expected {fmt} {size}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             problems.append(f"{rel}: UNREADABLE ({exc})")
 
     # squircles must keep transparent corners (alpha extrema include 0)
@@ -967,7 +968,6 @@ def cmd_check(source: Path, out: Path) -> int:
         for i in range(count):
             entry = data[6 + i * 16 : 6 + (i + 1) * 16]
             w = entry[0] or 256
-            h = entry[1] or 256
             sizes.append(w)
         return sorted(set(sizes))
 
@@ -984,7 +984,7 @@ def cmd_check(source: Path, out: Path) -> int:
             got = ico_sizes(path)
             if got != sizes:
                 problems.append(f"{rel}: ICO frames {got}, expected {sizes}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             problems.append(f"{rel}: UNREADABLE ({exc})")
 
     if not problems:

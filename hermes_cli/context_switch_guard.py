@@ -24,7 +24,7 @@ def _threshold_tokens(compressor: Any, model: str, context_length: int, provider
     return max(int(context_length * float(getattr(compressor, "threshold_percent", 0.5))), MINIMUM_CONTEXT_LENGTH)
 
 
-def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int]:
+def _estimate_tokens(agent: Any, messages: Optional[list[dict]]) -> Optional[int]:
     cc = getattr(agent, "context_compressor", None)
     if cc is None:
         return None
@@ -54,7 +54,7 @@ def merge_preflight_compression_warning(
     result: ModelSwitchResult,
     *,
     agent: Any = None,
-    messages: Optional[List[dict]] = None,
+    messages: Optional[list[dict]] = None,
     custom_providers: list | None = None,
     config_context_length: int | None = None,
     configured_model: str | None = None,
@@ -123,7 +123,7 @@ def enrich_model_switch_warnings_for_gateway(
     source: Any,
     custom_providers: list | None = None,
     load_gateway_config: Callable[[], dict] | None = None) -> None:
-    """Gateway helper: cached agent + session DB messages."""
+    """Gateway helper: cached agent + the session's stored transcript."""
     lock = getattr(runner, "_agent_cache_lock", None)
     cache = getattr(runner, "_agent_cache", None)
     agent = None
@@ -156,7 +156,7 @@ def enrich_model_switch_warnings_for_gateway(
     if db is not None and store is not None:
         try:
             entry = store.get_or_create_session(source)
-            messages = db.get_messages_as_conversation(entry.session_id)
+            messages = [m.as_openai_message() for m in db.messages.read_conversation(entry.session_id)]
         except Exception:
             pass
 
