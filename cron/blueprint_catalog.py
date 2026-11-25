@@ -12,18 +12,18 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 __all__ = [
-    "BlueprintSlot",
-    "AutomationBlueprint",
     "CATALOG",
-    "get_blueprint",
-    "list_blueprints",
+    "WEEKDAY_PRESETS",
+    "AutomationBlueprint",
+    "BlueprintFillError",
+    "BlueprintSlot",
+    "blueprint_catalog_entry",
+    "blueprint_deeplink",
     "blueprint_form_schema",
     "blueprint_slash_command",
-    "blueprint_deeplink",
-    "blueprint_catalog_entry",
     "fill_blueprint",
-    "BlueprintFillError",
-    "WEEKDAY_PRESETS",
+    "get_blueprint",
+    "list_blueprints",
 ]
 
 
@@ -35,7 +35,7 @@ class BlueprintFillError(ValueError):
 _SLOT_TYPES = frozenset({"time", "enum", "text", "weekdays"})
 
 # Named weekday recurrences -> cron day-of-week field.
-WEEKDAY_PRESETS: Dict[str, str] = {
+WEEKDAY_PRESETS: dict[str, str] = {
     "everyday": "*",
     "weekdays": "1-5",
     "weekends": "0,6",
@@ -77,7 +77,7 @@ class AutomationBlueprint:
     schedule_template: str
     # Seed instruction for the agent / the cron job prompt; may contain {slot}s.
     prompt_template: str
-    slots: List[BlueprintSlot] = field(default_factory=list)
+    slots: list[BlueprintSlot] = field(default_factory=list)
     deliver_default: str = "origin"
     skills: tuple = ()        # skills the job loads before running
     tags: tuple = ()
@@ -90,7 +90,7 @@ class AutomationBlueprint:
 # Curated in-repo catalog
 # ---------------------------------------------------------------------------
 
-_TIME = lambda default="08:00": BlueprintSlot(  # noqa: E731 - concise factory
+_TIME = lambda default="08:00": BlueprintSlot(
     name="time", type="time", label="What time?", default=default,
     help="24h local time, e.g. 08:00",
 )
@@ -104,7 +104,7 @@ _DELIVER = BlueprintSlot(
 )
 
 
-CATALOG: List[AutomationBlueprint] = [
+CATALOG: list[AutomationBlueprint] = [
     AutomationBlueprint(
         key="morning-brief",
         title="Morning briefing",
@@ -114,15 +114,21 @@ CATALOG: List[AutomationBlueprint] = [
         schedule_template="{minute} {hour} * * *",
         prompt_template=(
             "Produce a concise morning briefing for the user: today's calendar "
-            "events, the local weather, and any urgent items. When Gmail/Google "
-            "Calendar are connected, follow the google-workspace skill's "
-            "references/daily-brief.md procedure (exact day window, conflict "
-            "detection, meeting prep, mail-to-meeting links). Keep it short and "
-            "scannable. If no data sources are connected, give a brief "
-            "good-morning with the date and offer to connect calendar/email."
+            "events, the local weather, and any urgent items. Read calendar and "
+            "mail from whatever the user has connected (connected apps such as "
+            "Gmail, Google Calendar or Outlook, or a set-up mail/calendar skill). "
+            "Use today's exact local day window; flag overlapping or back-to-back "
+            "meetings; note prep for meetings that a recent email relates to; "
+            "list mail that needs a reply or has a deadline today. Suggest actions "
+            "in the brief, but do not send mail, edit events, or create tasks. "
+            "Keep it short and scannable. If no calendar or mail source is connected, give a "
+            "brief good-morning with the date and weather and offer to connect "
+            "calendar/email."
         ),
+        # No attached skill: an attached skill that needs credentials (google-workspace) makes
+        # cron preflight refuse the whole job for anyone who has not set it up, so the fallback
+        # above never runs. Connected apps need no skill, and the agent loads one on demand.
         slots=[_TIME("08:00"), _DELIVER],
-        skills=("google-workspace",),
         tags=("daily", "briefing"),
     ),
     AutomationBlueprint(
@@ -553,7 +559,7 @@ CATALOG: List[AutomationBlueprint] = [
 _CATALOG_BY_KEY = {r.key: r for r in CATALOG}
 
 
-def list_blueprints() -> List[AutomationBlueprint]:
+def list_blueprints() -> list[AutomationBlueprint]:
     """The catalog every surface lists: built-ins, then the active profile's plugin blueprints.
     Resolved per call — plugins load per profile, so one process serving several profiles must not
     cache this."""
@@ -586,7 +592,7 @@ def _slot_default(blueprint: AutomationBlueprint, *names: str) -> Any:
 
 # --- Renderers --------------------------------------------------------------------------------
 
-def blueprint_form_schema(blueprint: AutomationBlueprint) -> Dict[str, Any]:
+def blueprint_form_schema(blueprint: AutomationBlueprint) -> dict[str, Any]:
     """Emit the JSON a form renderer (dashboard / GUI) needs for this blueprint."""
     return {
         "key": blueprint.key,
@@ -610,7 +616,7 @@ def blueprint_form_schema(blueprint: AutomationBlueprint) -> Dict[str, Any]:
     }
 
 
-def blueprint_slash_command(blueprint: AutomationBlueprint, values: Optional[Dict[str, Any]] = None) -> str:
+def blueprint_slash_command(blueprint: AutomationBlueprint, values: Optional[dict[str, Any]] = None) -> str:
     """Build the flattened ``/blueprint <key> slot=val …`` command string. Uses each slot's default
     when ``values`` is omitted (ready-to-paste for docs/dashboard). Free-text slots are quoted."""
     values = values or {}
@@ -628,7 +634,7 @@ def blueprint_slash_command(blueprint: AutomationBlueprint, values: Optional[Dic
     return " ".join(parts)
 
 
-def blueprint_deeplink(blueprint: AutomationBlueprint, values: Optional[Dict[str, Any]] = None) -> str:
+def blueprint_deeplink(blueprint: AutomationBlueprint, values: Optional[dict[str, Any]] = None) -> str:
     """Build the ``hermes://blueprint/<key>?slot=val`` deep-link URL."""
     from urllib.parse import quote, urlencode
 
@@ -664,7 +670,7 @@ def _humanize_schedule(blueprint: AutomationBlueprint) -> str:
     return f"daily at {when}" if when else "on a schedule"
 
 
-def blueprint_catalog_entry(blueprint: AutomationBlueprint) -> Dict[str, Any]:
+def blueprint_catalog_entry(blueprint: AutomationBlueprint) -> dict[str, Any]:
     """Unified serializable shape (docs generator + dashboard API): form schema + ready-to-paste
     slash command + deep-link URL + human-readable schedule."""
     return {
@@ -687,7 +693,7 @@ _DAY_TO_DOW = {
 }
 
 
-def _resolve_schedule(blueprint: AutomationBlueprint, values: Dict[str, Any]) -> str:
+def _resolve_schedule(blueprint: AutomationBlueprint, values: dict[str, Any]) -> str:
     """Fill the schedule_template placeholders from resolved slot values."""
     sched = blueprint.schedule_template
 
@@ -695,7 +701,7 @@ def _resolve_schedule(blueprint: AutomationBlueprint, values: Dict[str, Any]) ->
     if values.get("schedule"):
         return str(values["schedule"])
 
-    repl: Dict[str, str] = {}
+    repl: dict[str, str] = {}
 
     if "{minute}" in sched or "{hour}" in sched:
         time_val = values.get("time")
@@ -742,9 +748,9 @@ def _resolve_schedule(blueprint: AutomationBlueprint, values: Dict[str, Any]) ->
 
 
 def fill_blueprint(
-    blueprint: AutomationBlueprint, values: Dict[str, Any], *,
-    origin: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    blueprint: AutomationBlueprint, values: dict[str, Any], *,
+    origin: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Validate ``values`` and return ``cron.jobs.create_job`` kwargs.
 
     Missing required slots raise BlueprintFillError naming the slot (forms show field errors, the
@@ -758,7 +764,7 @@ def fill_blueprint(
             f"unknown slot{'s' if len(unknown) > 1 else ''}: "
             f"{', '.join(unknown)} — valid: {', '.join(s.name for s in blueprint.slots)}"
         )
-    resolved: Dict[str, Any] = {}
+    resolved: dict[str, Any] = {}
     for s in blueprint.slots:
         raw = values.get(s.name, s.default)
         if raw in (None, ""):
@@ -778,7 +784,7 @@ def fill_blueprint(
     except KeyError as e:
         raise BlueprintFillError(f"blueprint prompt missing value for {e}") from e
 
-    spec: Dict[str, Any] = {
+    spec: dict[str, Any] = {
         "prompt": prompt,
         "schedule": schedule,
         "name": blueprint.title,
