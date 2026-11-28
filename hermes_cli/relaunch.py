@@ -120,11 +120,14 @@ def relaunch(
     POSIX: ``os.execvp`` in place (same PID, no double-fork). Windows has no real exec — its
     ``execvp`` emulation only works for a real Win32 executable, so spawn + exit instead.
     """
+    from hermes_cli.terminal_notify import restore_osc7577_token
+
     new_argv = build_relaunch_argv(extra_args, preserve_inherited=preserve_inherited, original_argv=original_argv)
+    restore_osc7577_token()
     if sys.platform == "win32":
         import subprocess
         try:
-            result = subprocess.run(new_argv)
+            result = subprocess.run(new_argv, check=False)
             sys.exit(result.returncode)
         except KeyboardInterrupt:
             sys.exit(130)
@@ -139,7 +142,9 @@ def relaunch(
             )
             sys.exit(1)
     else:
+        from hermes_cli.cpu_profile import write_cpu_profile
         from hermes_cli.observability.shared_metrics_startup import mark_in_place_relaunch
 
         mark_in_place_relaunch()
+        write_cpu_profile()  # exec skips atexit
         os.execvp(new_argv[0], new_argv)

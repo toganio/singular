@@ -79,7 +79,8 @@ def unavailable_reason(backend: str, target: str | None = None) -> str | None:
     if name is None:
         return f"unknown backend {backend}"
     target = target or pm.current_target()
-    reason = pm.get_package(name).missing_reason(target)
+    package = pm.get_package(name)
+    reason = package.missing_reason(target) or package.native_abi_reason(target)
     if reason:
         return reason
     lock = pm.Lockfile(pm.paths.lockfile_path())
@@ -204,7 +205,7 @@ def adopt_legacy_engine(backend: str) -> bool:
                 if _adopt(package, version, target, source, manifest, root, facts_path):
                     return True
                 _LEFT_IN_PLACE.add(source)
-    except Exception as exc:  # noqa: BLE001 - a failed move must not break the callers that ask
+    except Exception as exc:
         logger.warning("could not move the pre-PM llama.cpp %s engine into the PM store: %s", backend, exc)
     return False
 
