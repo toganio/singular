@@ -15,7 +15,7 @@
 #
 # Inputs (host mode, all required):
 #   --repo <dir>   hermes-agent checkout to build from (must contain the tag)
-#   --tag <tag>    immutable release tag (vX.Y.Z or vX.Y.Z+canary.<UTC timestamp>)
+#   --tag <tag>    immutable release tag (vX.Y.Z or canary.<UTC timestamp>-vX.Y.Z)
 #   --out <dir>    output dir (wheelhouse/ + index.json + SHA256SUMS land here)
 
 set -Eeuo pipefail
@@ -77,6 +77,11 @@ if [ "${1:-}" = "--in-container" ]; then
             libyaml openssl readline zlib liblzma libsqlite ncurses \
             || fail "apt install of the build toolchain failed"
     fi
+    # The payload's libc++ leads LD_LIBRARY_PATH, so it must be the one apt's cmake needs. If the
+    # pin table drifts from the pool, cmake cannot start and scikit-build-core compiles one from
+    # PyPI source, which takes 30 minutes to fail. Say so now.
+    cmake -E capabilities >/dev/null 2>&1 \
+        || fail "container cmake cannot start (payload libc++ older than apt's? run: hermes pm update --termux)"
     # BINARIES, not package names: the rust package provides rustc/cargo
     # (there is no `rust` binary).
     for tool in clang rustc cargo make git; do
@@ -132,6 +137,7 @@ if [ "${1:-}" = "--in-container" ]; then
     log "Building the android wheel set from sdist (bionic, payload ABI)"
     "$BUILD_VENV/bin/python" -u "$HERE/build_wheels.py" \
         --resolved "$RESOLVED" --build-set "$BUILD_SET" \
+        --lock "$PAYLOAD_ROOT/.work/tree/uv.lock" \
         --wheelhouse "$WHEELHOUSE" --retag "$HERE/retag_wheel.py" \
         --platform-tag "$PLATFORM_TAG" \
         || fail "wheel building failed"

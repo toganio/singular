@@ -7,7 +7,10 @@ name, the settings it already read, its data directory and tool names, so the mi
 * ``hermes update`` — for every profile home that shares the venv (primary; runs where the venv was
   just rebuilt anyway).
 * agent init — when the configured provider cannot be found at all, once per process (Desktop
-  users update through the app and never run ``hermes update`` by hand).
+  users update through the app and never run ``hermes update`` by hand). After a failed attempt,
+  starts skip it for :data:`STARTUP_RETRY_SECONDS`, doubling with each further failure up to
+  :data:`STARTUP_RETRY_MAX_SECONDS` (``hermes update`` always retries): every ``hermes chat``, cron
+  run and Desktop restart otherwise paid the network round trip again and showed the same failure.
 
 Both install the catalog entry at its reviewed pin through the normal plugin install path (kill
 list, dependency constraints, enable), never a custom source. Every outcome — installed, refused,
@@ -19,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -30,6 +34,50 @@ _attempted: set[tuple[str, str]] = set()
 # accepted the deps when they picked the built-in. Any other catalog plugin named in memory.provider
 # (a synced config, a cloned profile) still needs an explicit install.
 _LEFT_CORE = frozenset({"hindsight", "honcho", "mem0", "supermemory", "openviking", "retaindb", "byterover", "holographic"})
+
+# The startup retry window doubles with each consecutive failure, up to a week: a flat window had a
+# home whose install can never succeed (a version gate, a root-owned plugins dir, no route to GitHub)
+# fail once an hour for good, while an offline laptop still gets its plugin within the hour.
+STARTUP_RETRY_SECONDS = 3600.0
+STARTUP_RETRY_MAX_SECONDS = 7 * 24 * 3600.0
+
+
+def _failure_stamp(home: Path, plugin: str) -> Path:
+    """Written on every failed automatic install: its mtime and failure count gate the next startup attempt."""
+    return home / "cache" / f"left-core-{plugin}.failed"
+
+
+def _failure_count(stamp: Path) -> int:
+    """Consecutive failures recorded in *stamp*; the empty stamp an older Hermes touched counts once."""
+    try:
+        text = stamp.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return 0
+    return int(text) if text.isdigit() else 1
+
+
+def _note_failure(home: Path, plugin: str) -> None:
+    stamp = _failure_stamp(home, plugin)
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(str(_failure_count(stamp) + 1), encoding="utf-8")
+    except OSError as exc:
+        logger.debug("left-core retry stamp not written for %s: %s", home, exc)
+
+
+def _failed_recently(home: Path, plugin: str) -> bool:
+    stamp = _failure_stamp(home, plugin)
+    try:
+        age = time.time() - stamp.stat().st_mtime
+    except OSError:
+        return False
+    failures = min(_failure_count(stamp), 32)
+    return age < min(STARTUP_RETRY_SECONDS * 2 ** (failures - 1), STARTUP_RETRY_MAX_SECONDS)
+
+
+def _note_success(home: Path, plugin: str) -> None:
+    """A later failure (the plugin removed, then missed again) starts the backoff from an hour."""
+    _failure_stamp(home, plugin).unlink(missing_ok=True)
 
 
 def configured_provider(home: Path) -> str:
@@ -104,12 +152,23 @@ def _install_command(name: str, home: Path) -> str:
     return f"hermes -p {profile} plugins install {name}"
 
 
+def kept_off_sentence(name: str, home: Path) -> str:
+    """Why an automatic install left *name* off in *home* (its ``plugins.disabled`` named it when the
+    enable ran, :func:`_install_into`), and the command that turns it on."""
+    enable = _install_command(name, home).replace(" plugins install ", " plugins enable ")
+    return f"plugins.disabled lists '{name}', so it is installed but off: run `{enable}` to turn it on."
+
+
 def _install_pending(home: Path, name: str, *, install: Callable[[str], dict],
                      say: Callable[[str], None]) -> bool:
     try:
         result = install(name)
     except Exception as exc:  # network, uv, kill list — report, do not raise
         result = {"ok": False, "error": str(exc)}
+    if result.get("kept_disabled"):
+        say(f"  ⚠ Memory provider '{name}' moved out of core — installed its plugin from the catalog, but "
+            f"{kept_off_sentence(name, home)}")
+        return True
     if result.get("ok"):
         say(f"  ✓ Memory provider '{name}' moved out of core — installed its plugin from the catalog "
             f"(memory.provider and your stored memories are unchanged; check its settings with "
@@ -159,12 +218,14 @@ def _home_consent(home: Path) -> bool:
 
 
 def _install_into(home: Path, *, consent: Optional[bool] = None) -> Callable[[str], dict]:
+    """The unattended install into *home*: a ``plugins.disabled`` entry naming the plugin when its enable
+    runs keeps it off (``kept_disabled``), never lifted."""
     def _install(name: str) -> dict:
         from hermes_cli.plugins_cmd import dashboard_install_plugin
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         token = set_hermes_home_override(home)
         try:
-            return dashboard_install_plugin("", force=False, enable=True, catalog_name=name,
+            return dashboard_install_plugin("", force=False, enable=True, catalog_name=name, unattended=True,
                                             assume_deps_consent=(name in _LEFT_CORE and _unattended_consent())
                                             if consent is None else consent)
         finally:
@@ -265,4 +326,13 @@ def recover_at_startup(name: str, *, say: Optional[Callable[[str], None]] = None
                    f"It never shipped with Hermes, so Hermes installs it only when you ask: "
                    f"run `{_install_command(name, home)}`.")
         return False
-    return migrate_home(home, install=_install_into(home, consent=True), say=report) == name
+    if _failed_recently(home, name):
+        report(f"⚠ Memory provider '{name}' is not installed, so external memory is off for this session. "
+               f"Its automatic install failed recently: run `{_install_command(name, home)}`.")
+        return False
+    installed = migrate_home(home, install=_install_into(home, consent=True), say=report) == name
+    if installed:
+        _note_success(home, name)
+    else:
+        _note_failure(home, name)
+    return installed
